@@ -3,7 +3,7 @@ import Combine
 
 private enum DashboardPage: String, CaseIterable, Identifiable {
     case home = "Home"
-    case tasks = "Tasks"
+    case stickyNotes = "Sticky Notes"
     case insights = "Insights"
     case settings = "Settings"
 
@@ -11,7 +11,7 @@ private enum DashboardPage: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .home: "house"
-        case .tasks: "list.bullet.rectangle"
+        case .stickyNotes: "note.text"
         case .insights: "chart.line.uptrend.xyaxis"
         case .settings: "gearshape"
         }
@@ -29,7 +29,13 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 18) {
                 SidebarRail(selection: $page)
                 Group {
-                    if page == .home { HomeDashboard() } else { EmptyPage(page: page) }
+                    if page == .home {
+                        HomeDashboard()
+                    } else if page == .stickyNotes {
+                        StickyNotesBoard()
+                    } else {
+                        EmptyPage(page: page)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -90,11 +96,16 @@ private struct EmptyPage: View {
 }
 
 private struct HomeDashboard: View {
+    @State private var selectedMode: DashboardMode = .screenTime
+
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
             VStack(spacing: 0) {
-                DashboardHeader()
-                AnalyticsPanel().padding(.horizontal, 26).padding(.bottom, 22)
+                DashboardHeader(selectedMode: $selectedMode)
+                Group {
+                    if selectedMode == .calendar { CalendarPanel() } else { AnalyticsPanel() }
+                }
+                .padding(.horizontal, 26).padding(.bottom, 22)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Palette.panel)
@@ -106,8 +117,14 @@ private struct HomeDashboard: View {
     }
 }
 
+private enum DashboardMode {
+    case calendar
+    case screenTime
+}
+
 private struct DashboardHeader: View {
-    @State private var selectedTab = 1
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    @Binding var selectedMode: DashboardMode
 
     var body: some View {
         HStack {
@@ -115,11 +132,28 @@ private struct DashboardHeader: View {
                 .font(.system(size: 24, weight: .bold))
             Spacer()
             HStack(spacing: 0) {
-                SegmentButton(title: "Calendar", selected: selectedTab == 0) { selectedTab = 0 }
-                SegmentButton(title: "Screen Time", selected: selectedTab == 1) { selectedTab = 1 }
+                SegmentButton(title: "Calendar", selected: selectedMode == .calendar) { selectedMode = .calendar }
+                SegmentButton(title: "Screen Time", selected: selectedMode == .screenTime) { selectedMode = .screenTime }
             }
             .padding(4).background(Palette.track)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            if selectedMode == .screenTime {
+                Button {
+                    tracker.isTracking ? tracker.stopTracking() : tracker.startTracking()
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle().fill(tracker.isTracking ? Palette.focus : Palette.muted).frame(width: 7, height: 7)
+                        Text(tracker.isTracking ? "Tracking" : "Start tracking")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 12).frame(height: 36)
+                    .background(Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help(tracker.isTracking ? "Stop screen-time tracking" : "Track active apps and browser domains locally")
+            }
         }
         .padding(.horizontal, 28).padding(.vertical, 16)
     }
@@ -156,22 +190,67 @@ private struct AnalyticsPanel: View {
 }
 
 private struct TrackedTimeCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    @State private var displayedDate = Date()
+    private let calendar = Calendar.current
+
     var body: some View {
         VStack(spacing: 12) {
             HStack {
-                Text("0h 0min Tracked").font(.system(size: 26, weight: .bold))
+                Text("\(tracker.formattedDuration(for: displayedDate)) Tracked").font(.system(size: 26, weight: .bold))
                 Spacer()
                 MetricLegend(label: "FOCUS", color: Palette.focus)
                 MetricLegend(label: "NEUTRAL", color: Palette.neutral)
                 MetricLegend(label: "DRIFT", color: Palette.drift)
                 Spacer()
-                Text("‹   Today   ›").font(.system(size: 12, weight: .semibold))
+                HStack(spacing: 5) {
+                    ChartDayButton(symbol: "chevron.left", help: "Previous day") { moveDay(-1) }
+                    Button {
+                        displayedDate = tracker.trackingDay(containing: Date())
+                    } label: {
+                        Text(dayLabel)
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(minWidth: 64, minHeight: 28)
+                    }
+                    .buttonStyle(.plain)
+                    ChartDayButton(symbol: "chevron.right", help: "Next day") { moveDay(1) }
+                }
             }.padding(.horizontal, 8)
-            ActivityChart()
+            ActivityChart(segments: tracker.chartSegments(for: displayedDate))
         }
         .padding(18).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+        .onAppear { displayedDate = tracker.trackingDay(containing: Date()) }
+    }
+
+    private var dayLabel: String {
+        let today = tracker.trackingDay(containing: Date())
+        if calendar.isDate(displayedDate, inSameDayAs: today) { return "Today" }
+        return displayedDate.formatted(.dateTime.month(.abbreviated).day())
+    }
+
+    private func moveDay(_ value: Int) {
+        displayedDate = calendar.date(byAdding: .day, value: value, to: displayedDate) ?? displayedDate
+    }
+}
+
+private struct ChartDayButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .bold))
+                .frame(width: 28, height: 28)
+                .background(Palette.panel)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Palette.grid, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -188,21 +267,97 @@ private struct MetricLegend: View {
 }
 
 private struct ActivityChart: View {
+    let segments: [ScreenTimeChartSegment]
+    private let hours = (0..<24).map { (4 + $0) % 24 }
+    private let minuteTicks = [0, 15, 30, 45, 60]
+
     var body: some View {
         GeometryReader { proxy in
-            let width = proxy.size.width
-            let height = proxy.size.height
-            ZStack(alignment: .topLeading) {
-                ForEach(0..<24, id: \.self) { index in
-                    Rectangle().fill(Palette.grid).frame(width: 1)
-                        .offset(x: width * CGFloat(index) / 24)
+            let yAxisWidth: CGFloat = 38
+            let topAxisHeight: CGFloat = 24
+            let plotWidth = max(1, proxy.size.width - yAxisWidth)
+            let plotHeight = max(1, proxy.size.height - topAxisHeight)
+
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    Text("MIN")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(Palette.muted)
+                        .padding(.trailing, 6)
+                        .frame(width: yAxisWidth, alignment: .trailing)
+                    HStack(spacing: 0) {
+                        ForEach(hours, id: \.self) { hour in
+                            Text(hourLabel(hour))
+                                .font(.system(size: 7, weight: .semibold))
+                                .foregroundStyle(Palette.muted)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .frame(width: plotWidth)
                 }
-                ForEach(0..<7, id: \.self) { index in
-                    Rectangle().fill(Palette.grid).frame(height: 1)
-                        .offset(y: height * CGFloat(index) / 6)
+                .frame(height: topAxisHeight)
+
+                HStack(spacing: 0) {
+                    GeometryReader { axis in
+                        ForEach(minuteTicks, id: \.self) { minute in
+                            let labelY = 5 + (axis.size.height - 10) * CGFloat(minute) / 60
+                            Text("\(minute)")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Palette.muted)
+                                .position(x: axis.size.width - 10, y: labelY)
+                        }
+                    }
+                    .frame(width: yAxisWidth, height: plotHeight)
+
+                    ZStack(alignment: .topLeading) {
+                        ForEach(0...24, id: \.self) { column in
+                            Rectangle().fill(Palette.grid).frame(width: 1, height: plotHeight)
+                                .offset(x: plotWidth * CGFloat(column) / 24)
+                        }
+                        ForEach(0..<5, id: \.self) { row in
+                            Rectangle().fill(Palette.grid).frame(width: plotWidth, height: 1)
+                                .offset(y: plotHeight * CGFloat(row) / 4)
+                        }
+                        HStack(alignment: .top, spacing: 0) {
+                            ForEach(0..<24, id: \.self) { index in
+                                ZStack(alignment: .top) {
+                                    ForEach(segments.filter { $0.hourIndex == index }) { segment in
+                                        let startY = plotHeight * CGFloat(segment.startMinute / 60)
+                                        let segmentHeight = plotHeight * CGFloat((segment.endMinute - segment.startMinute) / 60)
+                                        RoundedRectangle(cornerRadius: 2)
+                                            .fill(Palette.neutral)
+                                            .frame(height: max(2, segmentHeight))
+                                            .offset(y: startY)
+                                            .help(segmentHelp(segment, hour: hours[index]))
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 4)
+                            }
+                        }
+                        .frame(width: plotWidth, height: plotHeight)
+                    }
+                    .frame(width: plotWidth, height: plotHeight)
+                    .background(Palette.panel.opacity(0.45))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.grid, lineWidth: 1))
                 }
-            }.clipShape(RoundedRectangle(cornerRadius: 10))
+                .frame(height: plotHeight)
+            }
         }
+    }
+
+    private func hourLabel(_ hour: Int) -> String {
+        if hour == 0 { return "12 AM" }
+        if hour < 12 { return "\(hour) AM" }
+        if hour == 12 { return "12 PM" }
+        return "\(hour - 12) PM"
+    }
+
+    private func segmentHelp(_ segment: ScreenTimeChartSegment, hour: Int) -> String {
+        let start = Int(segment.startMinute.rounded(.down))
+        let end = Int(segment.endMinute.rounded(.up))
+        return "\(segment.activityName) · \(hourLabel(hour)) \(String(format: "%02d", start))–\(String(format: "%02d", end))"
     }
 }
 
@@ -236,6 +391,7 @@ private struct FocusDriftCard: View {
 }
 
 private struct ProductivityCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
     var body: some View {
         HStack(spacing: 22) {
             VStack(alignment: .leading, spacing: 16) {
@@ -250,13 +406,13 @@ private struct ProductivityCard: View {
             }
             VStack(alignment: .leading, spacing: 10) {
                 StatRow(name: "Focus", value: "0h")
-                StatRow(name: "Neutral", value: "0h")
+                StatRow(name: "Neutral", value: tracker.shortDuration(tracker.todayDuration))
                 StatRow(name: "Drift", value: "0h")
             }
             Spacer()
             VStack(alignment: .leading, spacing: 12) {
-                Text("Waiting for data").font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
-                Text("No activity recorded").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                Text(tracker.isTracking ? "Tracking locally" : "Tracking paused").font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
+                Text(tracker.sessions.isEmpty ? "No activity recorded" : "App activity recorded").font(.system(size: 10)).foregroundStyle(Palette.muted)
             }
         }
         .padding(18).frame(maxWidth: .infinity).background(Palette.surface)
@@ -278,22 +434,27 @@ private struct StatRow: View {
 }
 
 private struct DistractionCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+
     var body: some View {
+        let summary = tracker.topActivityToday
         VStack(alignment: .leading, spacing: 16) {
-            Text("Most used distraction").font(.system(size: 16, weight: .semibold))
+            Text("Most used app / website").font(.system(size: 16, weight: .semibold))
             HStack(spacing: 12) {
                 Image(systemName: "clock").foregroundStyle(Palette.muted)
                     .frame(width: 30, height: 30).background(Palette.progressBackground)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("No activity yet").font(.system(size: 13, weight: .semibold))
-                    Text("Screen-time data will appear here").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                    Text(summary?.name ?? "No activity yet").font(.system(size: 13, weight: .semibold))
+                    Text(summary == nil ? "Screen-time data will appear here" : "Active app or browser domain")
+                        .font(.system(size: 10)).foregroundStyle(Palette.muted)
                 }
                 Spacer()
-                Text("0m").font(.system(size: 14, weight: .semibold))
+                Text(summary.map { tracker.shortDuration($0.duration) } ?? "0m").font(.system(size: 14, weight: .semibold))
             }
             Capsule().fill(Palette.progressBackground).frame(height: 8)
-            Text("0 sessions  ·  0m average").font(.system(size: 10)).foregroundStyle(Palette.muted)
+            Text(summary.map { "\($0.sessionCount) sessions  ·  \(tracker.shortDuration($0.averageDuration)) average" } ?? "0 sessions  ·  0m average")
+                .font(.system(size: 10)).foregroundStyle(Palette.muted)
         }
         .padding(18).frame(maxWidth: .infinity).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -448,7 +609,7 @@ private struct AddGoalSheet: View {
     }
 }
 
-private enum Palette {
+enum Palette {
     static let canvas = Color(red: 0.93, green: 0.92, blue: 0.89)
     static let panel = Color(red: 0.985, green: 0.98, blue: 0.96)
     static let surface = Color(red: 0.975, green: 0.97, blue: 0.94)
