@@ -185,8 +185,17 @@ private struct StickyNoteCard: View {
     let command: RichTextCommand?
     let onSelect: () -> Void
 
-    @State private var dragOrigin: CGPoint?
-    @State private var resizeOrigin: CGSize?
+    @GestureState private var dragTranslation = CGSize.zero
+    @GestureState private var resizeTranslation = CGSize.zero
+    @State private var isInteracting = false
+
+    private var renderedPosition: CGPoint {
+        constrainedPosition(for: dragTranslation)
+    }
+
+    private var renderedSize: CGSize {
+        constrainedSize(for: resizeTranslation)
+    }
 
     var body: some View {
         ZStack {
@@ -234,44 +243,71 @@ private struct StickyNoteCard: View {
                 }
             }
         }
-        .frame(width: note.width, height: note.height)
+        .frame(width: renderedSize.width, height: renderedSize.height)
         .clipShape(NoteShapePath(shape: note.shape))
         .overlay {
             NoteShapePath(shape: note.shape)
-                .stroke(isSelected ? Palette.ink : Palette.border.opacity(0.6), lineWidth: isSelected ? 2 : 1)
+                .stroke(isSelected ? Palette.ink : Palette.border.opacity(0.6), lineWidth: isSelected ? 1.25 : 0.75)
         }
-        .offset(x: note.positionX, y: note.positionY)
+        .compositingGroup()
+        .offset(x: renderedPosition.x, y: renderedPosition.y)
+        .transaction { $0.animation = nil }
         .onTapGesture(perform: onSelect)
     }
 
     private var moveGesture: some Gesture {
         DragGesture()
-            .onChanged { value in
-                onSelect()
-                let origin = dragOrigin ?? CGPoint(x: note.positionX, y: note.positionY)
-                if dragOrigin == nil { dragOrigin = origin }
-                let maxX = max(0, canvasSize.width - note.width)
-                let maxY = max(0, canvasSize.height - note.height)
-                let x = min(max(0, origin.x + value.translation.width), maxX)
-                let y = min(max(0, origin.y + value.translation.height), maxY)
-                store.updateStickyNoteFrame(note.id, x: x, y: y)
+            .updating($dragTranslation) { value, state, _ in
+                state = value.translation
             }
-            .onEnded { _ in dragOrigin = nil }
+            .onChanged { _ in
+                if !isInteracting {
+                    isInteracting = true
+                    onSelect()
+                }
+            }
+            .onEnded { value in
+                let position = constrainedPosition(for: value.translation)
+                store.updateStickyNoteFrame(note.id, x: position.x, y: position.y)
+                isInteracting = false
+            }
     }
 
     private var resizeGesture: some Gesture {
         DragGesture()
-            .onChanged { value in
-                onSelect()
-                let origin = resizeOrigin ?? CGSize(width: note.width, height: note.height)
-                if resizeOrigin == nil { resizeOrigin = origin }
-                let maxWidth = max(180, canvasSize.width - note.positionX)
-                let maxHeight = max(140, canvasSize.height - note.positionY)
-                let width = min(max(180, origin.width + value.translation.width), maxWidth)
-                let height = min(max(140, origin.height + value.translation.height), maxHeight)
-                store.updateStickyNoteFrame(note.id, width: width, height: height)
+            .updating($resizeTranslation) { value, state, _ in
+                state = value.translation
             }
-            .onEnded { _ in resizeOrigin = nil }
+            .onChanged { _ in
+                if !isInteracting {
+                    isInteracting = true
+                    onSelect()
+                }
+            }
+            .onEnded { value in
+                let size = constrainedSize(for: value.translation)
+                store.updateStickyNoteFrame(note.id, width: size.width, height: size.height)
+                isInteracting = false
+            }
+    }
+
+    private func constrainedPosition(for translation: CGSize) -> CGPoint {
+        let size = renderedSize
+        let maxX = max(0, canvasSize.width - size.width)
+        let maxY = max(0, canvasSize.height - size.height)
+        return CGPoint(
+            x: min(max(0, note.positionX + translation.width), maxX),
+            y: min(max(0, note.positionY + translation.height), maxY)
+        )
+    }
+
+    private func constrainedSize(for translation: CGSize) -> CGSize {
+        let maxWidth = max(180, canvasSize.width - note.positionX)
+        let maxHeight = max(140, canvasSize.height - note.positionY)
+        return CGSize(
+            width: min(max(180, note.width + translation.width), maxWidth),
+            height: min(max(140, note.height + translation.height), maxHeight)
+        )
     }
 }
 
@@ -302,7 +338,7 @@ private struct NoteShapePath: Shape {
         case .rectangle:
             return Rectangle().path(in: rect)
         case .rounded:
-            return RoundedRectangle(cornerRadius: 18, style: .continuous).path(in: rect)
+            return RoundedRectangle(cornerRadius: 12, style: .continuous).path(in: rect)
         case .circle:
             return Ellipse().path(in: rect)
         }
