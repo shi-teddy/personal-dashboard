@@ -25,7 +25,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Color.clear.frame(height: 46)
+            Color.clear.frame(height: 18)
             HStack(alignment: .top, spacing: 18) {
                 SidebarRail(selection: $page)
                 Group {
@@ -33,6 +33,8 @@ struct ContentView: View {
                         HomeDashboard()
                     } else if page == .stickyNotes {
                         StickyNotesBoard()
+                    } else if page == .settings {
+                        ClassificationSettingsView()
                     } else {
                         EmptyPage(page: page)
                     }
@@ -105,7 +107,8 @@ private struct HomeDashboard: View {
                 Group {
                     if selectedMode == .calendar { CalendarPanel() } else { AnalyticsPanel() }
                 }
-                .padding(.horizontal, 26).padding(.bottom, 22)
+                .padding(.horizontal, selectedMode == .calendar ? 10 : 26)
+                .padding(.bottom, selectedMode == .calendar ? 8 : 22)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Palette.panel)
@@ -123,7 +126,6 @@ private enum DashboardMode {
 }
 
 private struct DashboardHeader: View {
-    @EnvironmentObject private var tracker: ScreenTimeTracker
     @Binding var selectedMode: DashboardMode
 
     var body: some View {
@@ -138,21 +140,16 @@ private struct DashboardHeader: View {
             .padding(4).background(Palette.track)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             if selectedMode == .screenTime {
-                Button {
-                    tracker.isTracking ? tracker.stopTracking() : tracker.startTracking()
-                } label: {
-                    HStack(spacing: 6) {
-                        Circle().fill(tracker.isTracking ? Palette.focus : Palette.muted).frame(width: 7, height: 7)
-                        Text(tracker.isTracking ? "Tracking" : "Start tracking")
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(.horizontal, 12).frame(height: 36)
-                    .background(Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
+                HStack(spacing: 6) {
+                    Circle().fill(Palette.focus).frame(width: 7, height: 7)
+                    Text("Tracking")
                 }
-                .buttonStyle(.plain)
-                .help(tracker.isTracking ? "Stop screen-time tracking" : "Track active apps and browser domains locally")
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.horizontal, 12).frame(height: 36)
+                .background(Palette.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
+                .help("Tracking active apps and browser domains locally while Personal Dashboard is open")
             }
         }
         .padding(.horizontal, 28).padding(.vertical, 16)
@@ -177,21 +174,30 @@ private struct SegmentButton: View {
 }
 
 private struct AnalyticsPanel: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    @State private var displayedDate = Date()
+
     var body: some View {
         VStack(spacing: 12) {
-            TrackedTimeCard().frame(maxHeight: .infinity)
-            FocusDriftCard().frame(height: 152)
-            HStack(spacing: 26) { ProductivityCard(); DistractionCard() }.frame(height: 166)
+            TrackedTimeCard(displayedDate: $displayedDate).frame(maxHeight: .infinity)
+            FocusDriftCard(displayedDate: displayedDate).frame(height: 152)
+            HStack(spacing: 26) {
+                ProductivityCard(displayedDate: displayedDate)
+                TopActivityCard(displayedDate: displayedDate)
+            }
+            .frame(height: 166)
         }
         .padding(14).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
+        .onAppear { displayedDate = tracker.trackingDay(containing: Date()) }
     }
 }
 
 private struct TrackedTimeCard: View {
+    @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
-    @State private var displayedDate = Date()
+    @Binding var displayedDate: Date
     private let calendar = Calendar.current
 
     var body: some View {
@@ -216,12 +222,14 @@ private struct TrackedTimeCard: View {
                     ChartDayButton(symbol: "chevron.right", help: "Next day") { moveDay(1) }
                 }
             }.padding(.horizontal, 8)
-            ActivityChart(segments: tracker.chartSegments(for: displayedDate))
+            ActivityChart(segments: tracker.chartSegments(
+                for: displayedDate,
+                classificationRules: store.classificationRules
+            ))
         }
         .padding(18).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
-        .onAppear { displayedDate = tracker.trackingDay(containing: Date()) }
     }
 
     private var dayLabel: String {
@@ -310,6 +318,7 @@ private struct ActivityChart: View {
                     .frame(width: yAxisWidth, height: plotHeight)
 
                     ZStack(alignment: .topLeading) {
+                        let columnWidth = plotWidth / 24
                         ForEach(0...24, id: \.self) { column in
                             Rectangle().fill(Palette.grid).frame(width: 1, height: plotHeight)
                                 .offset(x: plotWidth * CGFloat(column) / 24)
@@ -318,24 +327,17 @@ private struct ActivityChart: View {
                             Rectangle().fill(Palette.grid).frame(width: plotWidth, height: 1)
                                 .offset(y: plotHeight * CGFloat(row) / 4)
                         }
-                        HStack(alignment: .top, spacing: 0) {
-                            ForEach(0..<24, id: \.self) { index in
-                                ZStack(alignment: .top) {
-                                    ForEach(segments.filter { $0.hourIndex == index }) { segment in
-                                        let startY = plotHeight * CGFloat(segment.startMinute / 60)
-                                        let segmentHeight = plotHeight * CGFloat((segment.endMinute - segment.startMinute) / 60)
-                                        RoundedRectangle(cornerRadius: 2)
-                                            .fill(Palette.neutral)
-                                            .frame(height: max(2, segmentHeight))
-                                            .offset(y: startY)
-                                            .help(segmentHelp(segment, hour: hours[index]))
-                                    }
-                                }
-                                .frame(maxWidth: .infinity)
-                                .padding(.horizontal, 4)
+                        ForEach(0..<24, id: \.self) { index in
+                            ForEach(segments.filter { $0.hourIndex == index }) { segment in
+                                let startY = plotHeight * CGFloat(segment.startMinute / 60)
+                                let segmentHeight = plotHeight * CGFloat((segment.endMinute - segment.startMinute) / 60)
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(segment.classification.dashboardColor)
+                                    .frame(width: max(1, columnWidth - 3), height: segmentHeight)
+                                    .offset(x: CGFloat(index) * columnWidth + 1.5, y: startY)
+                                    .help(segmentHelp(segment, hour: hours[index]))
                             }
                         }
-                        .frame(width: plotWidth, height: plotHeight)
                     }
                     .frame(width: plotWidth, height: plotHeight)
                     .background(Palette.panel.opacity(0.45))
@@ -355,19 +357,29 @@ private struct ActivityChart: View {
     }
 
     private func segmentHelp(_ segment: ScreenTimeChartSegment, hour: Int) -> String {
-        let start = Int(segment.startMinute.rounded(.down))
-        let end = Int(segment.endMinute.rounded(.up))
-        return "\(segment.activityName) · \(hourLabel(hour)) \(String(format: "%02d", start))–\(String(format: "%02d", end))"
+        let start = Int(segment.activityWindowStartMinute.rounded(.down))
+        let end = Int(segment.activityWindowEndMinute.rounded(.up))
+        let trackedMinutes = Int(segment.trackedDuration / 60)
+        let trackedSeconds = Int(segment.trackedDuration) % 60
+        return "\(segment.activityName) · \(segment.classification.displayName) · \(trackedMinutes)m \(trackedSeconds)s tracked between \(hourLabel(hour)) \(String(format: "%02d", start))–\(String(format: "%02d", end))"
     }
 }
 
 private struct FocusDriftCard: View {
+    @EnvironmentObject private var store: DashboardStore
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let displayedDate: Date
+
     var body: some View {
+        let points = tracker.focusDriftPoints(
+            for: displayedDate,
+            classificationRules: store.classificationRules
+        )
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Focus / drift score").font(.system(size: 16, weight: .semibold))
-                    Text("30 minute windows").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                    Text("30 minute windows · maximum 30").font(.system(size: 11)).foregroundStyle(Palette.muted)
                 }
                 Spacer()
                 HStack(spacing: 24) {
@@ -375,11 +387,23 @@ private struct FocusDriftCard: View {
                     Label("Drift", systemImage: "circle.fill").foregroundStyle(Palette.warning)
                 }.font(.system(size: 10))
             }
-            GeometryReader { _ in
-                VStack(spacing: 0) {
-                    ForEach(0..<4, id: \.self) { _ in
-                        Spacer()
-                        Rectangle().fill(Palette.grid).frame(height: 1)
+            GeometryReader { proxy in
+                ZStack {
+                    VStack(spacing: 0) {
+                        ForEach(0..<4, id: \.self) { row in
+                            Rectangle().fill(Palette.grid).frame(height: 1)
+                            if row != 3 { Spacer() }
+                        }
+                    }
+                    if points.isEmpty {
+                        Text("Classified activity will build this trend")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Palette.muted)
+                    } else {
+                        scorePath(points: points, size: proxy.size, keyPath: \.focusScore)
+                            .stroke(Palette.focus, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                        scorePath(points: points, size: proxy.size, keyPath: \.driftScore)
+                            .stroke(Palette.warning, style: StrokeStyle(lineWidth: 1.7, lineCap: .round, lineJoin: .round, dash: [5, 4]))
                     }
                 }
             }
@@ -388,77 +412,205 @@ private struct FocusDriftCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
     }
+
+    private func scorePath(
+        points: [FocusDriftPoint],
+        size: CGSize,
+        keyPath: KeyPath<FocusDriftPoint, Double>
+    ) -> Path {
+        var path = Path()
+        for (index, point) in points.enumerated() {
+            let x = size.width * CGFloat(point.windowIndex) / 48
+            let score = min(30, max(0, point[keyPath: keyPath]))
+            let y = size.height * (1 - CGFloat(score / 30))
+            if index == 0 { path.move(to: CGPoint(x: x, y: y)) }
+            else { path.addLine(to: CGPoint(x: x, y: y)) }
+        }
+        return path
+    }
 }
 
 private struct ProductivityCard: View {
+    @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
+    let displayedDate: Date
+
     var body: some View {
-        HStack(spacing: 22) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Today’s productivity").font(.system(size: 16, weight: .semibold)).fixedSize(horizontal: true, vertical: false)
-                ZStack {
-                    Circle().stroke(Palette.progressBackground, lineWidth: 9)
-                    Circle().trim(from: 0, to: 0)
-                        .stroke(Palette.focus, style: StrokeStyle(lineWidth: 9, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                    Text("0%").font(.system(size: 21, weight: .bold))
-                }.frame(width: 86, height: 86)
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                StatRow(name: "Focus", value: "0h")
-                StatRow(name: "Neutral", value: tracker.shortDuration(tracker.todayDuration))
-                StatRow(name: "Drift", value: "0h")
-            }
-            Spacer()
+        let summary = tracker.productivitySummary(
+            for: displayedDate,
+            classificationRules: store.classificationRules
+        )
+        HStack(spacing: 18) {
             VStack(alignment: .leading, spacing: 12) {
-                Text(tracker.isTracking ? "Tracking locally" : "Tracking paused").font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
-                Text(tracker.sessions.isEmpty ? "No activity recorded" : "App activity recorded").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                Text("Day’s productivity")
+                    .font(.system(size: 16, weight: .semibold))
+                    .fixedSize(horizontal: true, vertical: false)
+                ProductivityRing(summary: summary)
+                    .frame(width: 82, height: 82)
             }
+            VStack(alignment: .leading, spacing: 9) {
+                StatRow(name: "Focus", value: tracker.shortDuration(summary.focusDuration), color: Palette.focus)
+                StatRow(name: "Neutral", value: tracker.shortDuration(summary.neutralDuration), color: Palette.neutral)
+                StatRow(name: "Drift", value: tracker.shortDuration(summary.driftDuration), color: Palette.warning)
+            }
+            Spacer(minLength: 4)
+            VStack(alignment: .leading, spacing: 7) {
+                Text(summary.totalDuration > 0 ? "\(summary.grade) grade" : "No grade yet")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(summary.totalDuration > 0 ? Palette.focus : Palette.muted)
+                Text(productivityMessage(summary))
+                    .font(.system(size: 10))
+                    .foregroundStyle(Palette.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: 108, alignment: .leading)
         }
-        .padding(18).frame(maxWidth: .infinity).background(Palette.surface)
+        .padding(16).frame(maxWidth: .infinity).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+
+    private func productivityMessage(_ summary: ScreenTimeProductivitySummary) -> String {
+        guard summary.totalDuration > 0 else { return "Classify activity in Settings to calculate your score." }
+        switch summary.score {
+        case 90...: return "Excellent focus day"
+        case 80...: return "Strong focus day"
+        case 70...: return "Productive day"
+        case 60...: return "Mixed focus day"
+        default: return "High-drift day"
+        }
+    }
+}
+
+private struct ProductivityRing: View {
+    let summary: ScreenTimeProductivitySummary
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Palette.progressBackground, lineWidth: 9)
+            if summary.totalDuration > 0 {
+                ForEach(Array(ProductivityClassification.allCases.enumerated()), id: \.offset) { index, classification in
+                    let bounds = segmentBounds(for: index)
+                    Circle()
+                        .trim(from: bounds.start, to: bounds.end)
+                        .stroke(
+                            classification.dashboardColor,
+                            style: StrokeStyle(lineWidth: 9, lineCap: .butt)
+                        )
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+            Text("\(summary.score)%").font(.system(size: 20, weight: .bold))
+        }
+    }
+
+    private func segmentBounds(for index: Int) -> (start: CGFloat, end: CGFloat) {
+        guard summary.totalDuration > 0 else { return (0, 0) }
+        let classifications = ProductivityClassification.allCases
+        let startDuration = classifications.prefix(index).reduce(0) {
+            $0 + summary.duration(for: $1)
+        }
+        let endDuration = startDuration + summary.duration(for: classifications[index])
+        return (
+            CGFloat(startDuration / summary.totalDuration),
+            CGFloat(endDuration / summary.totalDuration)
+        )
     }
 }
 
 private struct StatRow: View {
     let name: String
     let value: String
+    let color: Color
+
     var body: some View {
-        HStack(spacing: 8) {
-            Circle().fill(Palette.ink).frame(width: 9, height: 9)
-            Text(name).frame(width: 52, alignment: .leading)
-            Text(value)
-        }.font(.system(size: 12))
+        HStack(spacing: 7) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(name).frame(width: 48, alignment: .leading)
+            Text(value).monospacedDigit()
+        }
+        .font(.system(size: 11))
     }
 }
 
-private struct DistractionCard: View {
+private struct TopActivityCard: View {
+    @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
+    let displayedDate: Date
 
     var body: some View {
-        let summary = tracker.topActivityToday
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Most used app / website").font(.system(size: 16, weight: .semibold))
-            HStack(spacing: 12) {
-                Image(systemName: "clock").foregroundStyle(Palette.muted)
-                    .frame(width: 30, height: 30).background(Palette.progressBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(summary?.name ?? "No activity yet").font(.system(size: 13, weight: .semibold))
-                    Text(summary == nil ? "Screen-time data will appear here" : "Active app or browser domain")
-                        .font(.system(size: 10)).foregroundStyle(Palette.muted)
+        let summaries = tracker.topActivities(
+            for: displayedDate,
+            classificationRules: store.classificationRules,
+            limit: 3
+        )
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Top apps & sites").font(.system(size: 16, weight: .semibold))
+            if summaries.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "chart.bar.xaxis").foregroundStyle(Palette.muted)
+                    Text("Screen-time data will appear here")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Palette.muted)
                 }
-                Spacer()
-                Text(summary.map { tracker.shortDuration($0.duration) } ?? "0m").font(.system(size: 14, weight: .semibold))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ForEach(Array(summaries.enumerated()), id: \.offset) { index, summary in
+                    TopActivityRow(
+                        rank: index + 1,
+                        summary: summary,
+                        maximumDuration: summaries.first?.duration ?? 1
+                    )
+                }
             }
-            Capsule().fill(Palette.progressBackground).frame(height: 8)
-            Text(summary.map { "\($0.sessionCount) sessions  ·  \(tracker.shortDuration($0.averageDuration)) average" } ?? "0 sessions  ·  0m average")
-                .font(.system(size: 10)).foregroundStyle(Palette.muted)
         }
-        .padding(18).frame(maxWidth: .infinity).background(Palette.surface)
+        .padding(14).frame(maxWidth: .infinity).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+private struct TopActivityRow: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let rank: Int
+    let summary: ScreenTimeActivitySummary
+    let maximumDuration: TimeInterval
+
+    var body: some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 7) {
+                Text("\(rank)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(summary.classification.dashboardColor)
+                    .frame(width: 18, height: 18)
+                    .background(summary.classification.dashboardColor.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(summary.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                    Text("\(summary.classification.displayName) · \(summary.kind.displayName)")
+                        .font(.system(size: 8))
+                        .foregroundStyle(Palette.muted)
+                }
+                Spacer()
+                Text(tracker.shortDuration(summary.duration))
+                    .font(.system(size: 10, weight: .semibold))
+                    .monospacedDigit()
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Palette.progressBackground)
+                    Capsule().fill(summary.classification.dashboardColor)
+                        .frame(width: proxy.size.width * progress)
+                }
+            }
+            .frame(height: 4)
+            .padding(.leading, 25)
+        }
+    }
+
+    private var progress: CGFloat {
+        guard maximumDuration > 0 else { return 0 }
+        return CGFloat(min(1, summary.duration / maximumDuration))
     }
 }
 
@@ -532,6 +684,8 @@ private struct GoalRow: View {
 private struct TodoCard: View {
     @EnvironmentObject private var store: DashboardStore
     @State private var showingAddTodo = false
+    @State private var draggedTodoID: UUID?
+    @State private var todoDragOffset: CGFloat = 0
     private var completedCount: Int { store.todos.filter(\.isCompleted).count }
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -550,6 +704,12 @@ private struct TodoCard: View {
                             Button { store.deleteTodo(todo.id) } label: { Image(systemName: "xmark").font(.system(size: 9, weight: .bold)) }
                                 .buttonStyle(.plain).foregroundStyle(Palette.muted.opacity(0.75)).help("Delete todo")
                         }
+                        .contentShape(Rectangle())
+                        .offset(y: draggedTodoID == todo.id ? todoDragOffset : 0)
+                        .zIndex(draggedTodoID == todo.id ? 1 : 0)
+                        .opacity(draggedTodoID == todo.id ? 0.86 : 1)
+                        .simultaneousGesture(todoDragGesture(for: todo.id))
+                        .help("Drag to reorder")
                     }
                 }
             }
@@ -563,6 +723,29 @@ private struct TodoCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
         .sheet(isPresented: $showingAddTodo) { AddTodoSheet(isPresented: $showingAddTodo) }
+    }
+
+    private func todoDragGesture(for id: UUID) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .global)
+            .onChanged { value in
+                draggedTodoID = id
+                todoDragOffset = value.translation.height
+            }
+            .onEnded { value in
+                guard let sourceIndex = store.todos.firstIndex(where: { $0.id == id }) else {
+                    draggedTodoID = nil
+                    todoDragOffset = 0
+                    return
+                }
+                let rowStride: CGFloat = 30
+                let rowDelta = Int((value.translation.height / rowStride).rounded())
+                let destination = min(max(sourceIndex + rowDelta, 0), store.todos.count - 1)
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    store.moveTodo(id, toIndex: destination)
+                    draggedTodoID = nil
+                    todoDragOffset = 0
+                }
+            }
     }
 }
 
@@ -624,4 +807,14 @@ enum Palette {
     static let neutral = Color(red: 0.35, green: 0.43, blue: 0.49)
     static let drift = Color(red: 0.47, green: 0.29, blue: 0.43)
     static let warning = Color(red: 0.65, green: 0.25, blue: 0.22)
+}
+
+private extension ProductivityClassification {
+    var dashboardColor: Color {
+        switch self {
+        case .flow: Palette.focus
+        case .neutral: Palette.neutral
+        case .brainrot: Palette.warning
+        }
+    }
 }

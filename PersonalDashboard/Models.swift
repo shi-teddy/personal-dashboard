@@ -74,3 +74,60 @@ struct StickyNote: Identifiable, Codable, Equatable {
     var createdAt = Date()
     var updatedAt = Date()
 }
+
+enum ProductivityClassification: String, Codable, CaseIterable, Identifiable, Hashable {
+    case flow
+    case neutral
+    case brainrot
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .flow: "Flow"
+        case .neutral: "Neutral"
+        case .brainrot: "Brainrot"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .flow: "Flow-state productivity"
+        case .neutral: "Miscellaneous or necessary activity"
+        case .brainrot: "Distracting or unproductive activity"
+        }
+    }
+}
+
+enum ActivitySourceKind: String, Codable, CaseIterable, Identifiable {
+    case application
+    case website
+
+    var id: String { rawValue }
+    var displayName: String { self == .application ? "Application" : "Website" }
+}
+
+struct ClassificationSubgroup: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String
+    var classification: ProductivityClassification
+    var createdAt = Date()
+}
+
+struct ActivityClassificationRule: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var displayName: String
+    var identifier: String
+    var kind: ActivitySourceKind
+    var classification: ProductivityClassification
+    var subgroupID: UUID
+    var createdAt = Date()
+}
+
+struct TrackedActivitySource: Identifiable, Hashable {
+    let displayName: String
+    let identifier: String
+    let kind: ActivitySourceKind
+
+    var id: String { "\(kind.rawValue):\(identifier.lowercased())" }
+}

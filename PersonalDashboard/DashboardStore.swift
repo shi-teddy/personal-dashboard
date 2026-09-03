@@ -15,11 +15,19 @@ final class DashboardStore: ObservableObject {
     @Published private(set) var stickyNotes: [StickyNote] = [] {
         didSet { save(stickyNotes, key: stickyNotesKey) }
     }
+    @Published private(set) var classificationSubgroups: [ClassificationSubgroup] = [] {
+        didSet { save(classificationSubgroups, key: classificationSubgroupsKey) }
+    }
+    @Published private(set) var classificationRules: [ActivityClassificationRule] = [] {
+        didSet { save(classificationRules, key: classificationRulesKey) }
+    }
 
     private let todoKey = "personal-dashboard.todos.v1"
     private let goalKey = "personal-dashboard.goals.v1"
     private let calendarKey = "personal-dashboard.calendar-events.v1"
     private let stickyNotesKey = "personal-dashboard.sticky-notes.v1"
+    private let classificationSubgroupsKey = "personal-dashboard.classification-subgroups.v1"
+    private let classificationRulesKey = "personal-dashboard.classification-rules.v1"
     private let defaults: UserDefaults
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -30,6 +38,9 @@ final class DashboardStore: ObservableObject {
         goals = load([GoalItem].self, key: goalKey) ?? Self.sampleGoals
         calendarEvents = load([CalendarEvent].self, key: calendarKey) ?? []
         stickyNotes = load([StickyNote].self, key: stickyNotesKey) ?? []
+        classificationSubgroups = load([ClassificationSubgroup].self, key: classificationSubgroupsKey)
+            ?? Self.defaultClassificationSubgroups
+        classificationRules = load([ActivityClassificationRule].self, key: classificationRulesKey) ?? []
         removeExpiredTodos()
     }
 
@@ -46,6 +57,23 @@ final class DashboardStore: ObservableObject {
 
     func deleteTodo(_ id: UUID) {
         todos.removeAll { $0.id == id }
+    }
+
+    func moveTodo(_ id: UUID, before targetID: UUID) {
+        guard id != targetID,
+              let sourceIndex = todos.firstIndex(where: { $0.id == id }) else { return }
+        let item = todos.remove(at: sourceIndex)
+        guard let targetIndex = todos.firstIndex(where: { $0.id == targetID }) else {
+            todos.append(item)
+            return
+        }
+        todos.insert(item, at: targetIndex)
+    }
+
+    func moveTodo(_ id: UUID, toIndex destinationIndex: Int) {
+        guard let sourceIndex = todos.firstIndex(where: { $0.id == id }) else { return }
+        let item = todos.remove(at: sourceIndex)
+        todos.insert(item, at: destinationIndex.clamped(to: 0...todos.count))
     }
 
     func removeExpiredTodos(now: Date = Date()) {
@@ -149,6 +177,128 @@ final class DashboardStore: ObservableObject {
         stickyNotes[index].updatedAt = Date()
     }
 
+    @discardableResult
+    func addClassificationSubgroup(name: String, classification: ProductivityClassification) -> UUID? {
+        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        let subgroup = ClassificationSubgroup(name: cleaned, classification: classification)
+        classificationSubgroups.append(subgroup)
+        return subgroup.id
+    }
+
+    func renameClassificationSubgroup(_ id: UUID, name: String) {
+        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let index = classificationSubgroups.firstIndex(where: { $0.id == id }) else { return }
+        classificationSubgroups[index].name = cleaned
+    }
+
+    func deleteClassificationSubgroup(_ id: UUID) {
+        classificationSubgroups.removeAll { $0.id == id }
+        classificationRules.removeAll { $0.subgroupID == id }
+    }
+
+    @discardableResult
+    func addClassificationRule(
+        input: String,
+        kind: ActivitySourceKind,
+        subgroupID: UUID
+    ) -> UUID? {
+        let cleaned = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let subgroup = classificationSubgroups.first(where: { $0.id == subgroupID }),
+              let identifier = normalizedIdentifier(cleaned, kind: kind) else { return nil }
+        let displayName = kind == .website ? identifier : cleaned
+        return upsertClassificationRule(
+            displayName: displayName,
+            identifier: identifier,
+            kind: kind,
+            subgroup: subgroup
+        )
+    }
+
+    @discardableResult
+    func classifyTrackedSource(_ source: TrackedActivitySource, subgroupID: UUID) -> UUID? {
+        guard let subgroup = classificationSubgroups.first(where: { $0.id == subgroupID }) else { return nil }
+        return upsertClassificationRule(
+            displayName: source.displayName,
+            identifier: source.identifier,
+            kind: source.kind,
+            subgroup: subgroup
+        )
+    }
+
+    func moveClassificationRule(_ id: UUID, to subgroupID: UUID) {
+        guard let ruleIndex = classificationRules.firstIndex(where: { $0.id == id }),
+              let subgroup = classificationSubgroups.first(where: { $0.id == subgroupID }) else { return }
+        classificationRules[ruleIndex].subgroupID = subgroup.id
+        classificationRules[ruleIndex].classification = subgroup.classification
+    }
+
+    func deleteClassificationRule(_ id: UUID) {
+        classificationRules.removeAll { $0.id == id }
+    }
+
+    func classificationRule(for source: TrackedActivitySource) -> ActivityClassificationRule? {
+        classificationRules.first { rule in
+            guard rule.kind == source.kind else { return false }
+            if rule.kind == .website {
+                let domain = source.identifier.lowercased()
+                let configured = rule.identifier.lowercased()
+                return domain == configured || domain.hasSuffix(".\(configured)")
+            }
+            return rule.identifier.caseInsensitiveCompare(source.identifier) == .orderedSame
+                || rule.identifier.caseInsensitiveCompare(source.displayName) == .orderedSame
+                || rule.displayName.caseInsensitiveCompare(source.displayName) == .orderedSame
+        }
+    }
+
+    func subgroups(for classification: ProductivityClassification) -> [ClassificationSubgroup] {
+        classificationSubgroups
+            .filter { $0.classification == classification }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func rules(in subgroupID: UUID) -> [ActivityClassificationRule] {
+        classificationRules
+            .filter { $0.subgroupID == subgroupID }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private func upsertClassificationRule(
+        displayName: String,
+        identifier: String,
+        kind: ActivitySourceKind,
+        subgroup: ClassificationSubgroup
+    ) -> UUID {
+        if let index = classificationRules.firstIndex(where: {
+            $0.kind == kind && $0.identifier.caseInsensitiveCompare(identifier) == .orderedSame
+        }) {
+            classificationRules[index].displayName = displayName
+            classificationRules[index].subgroupID = subgroup.id
+            classificationRules[index].classification = subgroup.classification
+            return classificationRules[index].id
+        }
+        let rule = ActivityClassificationRule(
+            displayName: displayName,
+            identifier: identifier,
+            kind: kind,
+            classification: subgroup.classification,
+            subgroupID: subgroup.id
+        )
+        classificationRules.append(rule)
+        return rule.id
+    }
+
+    private func normalizedIdentifier(_ input: String, kind: ActivitySourceKind) -> String? {
+        if kind == .application { return input.lowercased() }
+        let candidate = input.contains("://") ? input : "https://\(input)"
+        guard let components = URLComponents(string: candidate),
+              var host = components.host?.lowercased(), !host.isEmpty else { return nil }
+        if host.hasPrefix("www.") { host.removeFirst(4) }
+        return host
+    }
+
     private func save<T: Encodable>(_ value: T, key: String) {
         guard let data = try? encoder.encode(value) else { return }
         defaults.set(data, forKey: key)
@@ -167,6 +317,14 @@ final class DashboardStore: ObservableObject {
         TodoItem(title: "Laundry", completedAt: Date())
     ]
     private static let sampleGoals = [GoalItem(title: "Hit GM", progress: 70)]
+    private static let defaultClassificationSubgroups = [
+        ClassificationSubgroup(name: "School", classification: .flow),
+        ClassificationSubgroup(name: "College apps", classification: .flow),
+        ClassificationSubgroup(name: "Communication", classification: .neutral),
+        ClassificationSubgroup(name: "Utilities", classification: .neutral),
+        ClassificationSubgroup(name: "Social media", classification: .brainrot),
+        ClassificationSubgroup(name: "Video", classification: .brainrot)
+    ]
 }
 
 private extension Comparable {

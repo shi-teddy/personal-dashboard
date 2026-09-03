@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct StickyNotesBoard: View {
@@ -113,7 +114,17 @@ struct StickyNotesBoard: View {
                         guard let selectedNoteID else { return }
                         store.setStickyNoteColor(selectedNoteID, color: color)
                     } label: {
-                        Label(color.displayName, systemImage: selectedNote?.color == color ? "checkmark.circle.fill" : "circle.fill")
+                        HStack {
+                            Circle()
+                                .fill(color.fill)
+                                .frame(width: 12, height: 12)
+                                .overlay(Circle().stroke(Palette.muted.opacity(0.35), lineWidth: 0.5))
+                            Text(color.displayName)
+                            if selectedNote?.color == color {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
                     }
                 }
             } label: {
@@ -188,6 +199,7 @@ private struct StickyNoteCard: View {
     @GestureState private var dragTranslation = CGSize.zero
     @GestureState private var resizeTranslation = CGSize.zero
     @State private var isInteracting = false
+    @State private var previewText = ""
 
     private var renderedPosition: CGPoint {
         constrainedPosition(for: dragTranslation)
@@ -198,6 +210,40 @@ private struct StickyNoteCard: View {
     }
 
     var body: some View {
+        ZStack(alignment: .topLeading) {
+            noteSurface(isPreview: false)
+                .frame(width: note.width, height: note.height)
+                .clipShape(NoteShapePath(shape: note.shape))
+                .overlay {
+                    NoteShapePath(shape: note.shape)
+                        .stroke(isSelected ? Palette.ink : Palette.border.opacity(0.6), lineWidth: 0.75)
+                }
+                .position(
+                    x: note.positionX + note.width / 2,
+                    y: note.positionY + note.height / 2
+                )
+                .opacity(isInteracting ? 0.001 : 1)
+                .onTapGesture(perform: onSelect)
+
+            if isInteracting {
+                noteSurface(isPreview: true)
+                    .frame(width: renderedSize.width, height: renderedSize.height)
+                    .clipShape(NoteShapePath(shape: note.shape))
+                    .overlay {
+                        NoteShapePath(shape: note.shape)
+                            .stroke(Palette.ink, lineWidth: 0.75)
+                    }
+                    .drawingGroup(opaque: false, colorMode: .nonLinear)
+                    .offset(x: renderedPosition.x, y: renderedPosition.y)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
+        .transaction { $0.animation = nil }
+    }
+
+    @ViewBuilder
+    private func noteSurface(isPreview: Bool) -> some View {
         ZStack {
             NoteShapePath(shape: note.shape)
                 .fill(note.color.fill)
@@ -219,14 +265,25 @@ private struct StickyNoteCard: View {
                 .gesture(moveGesture)
                 .onTapGesture(perform: onSelect)
 
-                RichTextEditor(
-                    data: note.richTextData,
-                    command: command,
-                    onChange: { store.updateStickyNoteContent(note.id, data: $0) },
-                    onFocus: onSelect
-                )
-                .padding(.horizontal, note.shape == .circle ? 24 : 2)
-                .padding(.bottom, note.shape == .circle ? 24 : 4)
+                if isPreview {
+                    Text(previewText)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Palette.ink)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(.horizontal, note.shape == .circle ? 36 : 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, note.shape == .circle ? 24 : 8)
+                        .allowsHitTesting(false)
+                } else {
+                    RichTextEditor(
+                        data: note.richTextData,
+                        command: command,
+                        onChange: { store.updateStickyNoteContent(note.id, data: $0) },
+                        onFocus: onSelect
+                    )
+                    .padding(.horizontal, note.shape == .circle ? 24 : 2)
+                    .padding(.bottom, note.shape == .circle ? 24 : 4)
+                }
             }
 
             VStack {
@@ -243,16 +300,6 @@ private struct StickyNoteCard: View {
                 }
             }
         }
-        .frame(width: renderedSize.width, height: renderedSize.height)
-        .clipShape(NoteShapePath(shape: note.shape))
-        .overlay {
-            NoteShapePath(shape: note.shape)
-                .stroke(isSelected ? Palette.ink : Palette.border.opacity(0.6), lineWidth: isSelected ? 1.25 : 0.75)
-        }
-        .compositingGroup()
-        .offset(x: renderedPosition.x, y: renderedPosition.y)
-        .transaction { $0.animation = nil }
-        .onTapGesture(perform: onSelect)
     }
 
     private var moveGesture: some Gesture {
@@ -262,6 +309,7 @@ private struct StickyNoteCard: View {
             }
             .onChanged { _ in
                 if !isInteracting {
+                    previewText = note.dragPreviewText
                     isInteracting = true
                     onSelect()
                 }
@@ -280,6 +328,7 @@ private struct StickyNoteCard: View {
             }
             .onChanged { _ in
                 if !isInteracting {
+                    previewText = note.dragPreviewText
                     isInteracting = true
                     onSelect()
                 }
@@ -365,5 +414,17 @@ private extension StickyNoteShape {
         case .rounded: "square"
         case .circle: "circle"
         }
+    }
+}
+
+private extension StickyNote {
+    var dragPreviewText: String {
+        guard !richTextData.isEmpty,
+              let attributed = try? NSAttributedString(
+                data: richTextData,
+                options: [.documentType: NSAttributedString.DocumentType.rtf],
+                documentAttributes: nil
+              ) else { return "" }
+        return attributed.string
     }
 }

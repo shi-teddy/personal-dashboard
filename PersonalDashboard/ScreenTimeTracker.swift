@@ -28,7 +28,69 @@ struct ScreenTimeChartSegment: Identifiable, Equatable {
     let hourIndex: Int
     let startMinute: Double
     let endMinute: Double
+    let activityWindowStartMinute: Double
+    let activityWindowEndMinute: Double
+    let trackedDuration: TimeInterval
     let activityName: String
+    let classification: ProductivityClassification
+}
+
+struct FocusDriftPoint: Identifiable, Equatable {
+    let windowIndex: Int
+    let focusScore: Double
+    let driftScore: Double
+
+    var id: Int { windowIndex }
+}
+
+struct ScreenTimeProductivitySummary: Equatable {
+    let focusDuration: TimeInterval
+    let neutralDuration: TimeInterval
+    let driftDuration: TimeInterval
+
+    var totalDuration: TimeInterval { focusDuration + neutralDuration + driftDuration }
+
+    var score: Int {
+        guard totalDuration > 0 else { return 0 }
+        let weightedDuration = focusDuration + (neutralDuration * 0.5)
+        return Int((weightedDuration / totalDuration * 100).rounded())
+    }
+
+    var grade: String {
+        guard totalDuration > 0 else { return "—" }
+        return switch score {
+        case 97...: "A+"
+        case 93...: "A"
+        case 90...: "A−"
+        case 87...: "B+"
+        case 83...: "B"
+        case 80...: "B−"
+        case 77...: "C+"
+        case 73...: "C"
+        case 70...: "C−"
+        case 67...: "D+"
+        case 63...: "D"
+        case 60...: "D−"
+        default: "F"
+        }
+    }
+
+    func duration(for classification: ProductivityClassification) -> TimeInterval {
+        switch classification {
+        case .flow: focusDuration
+        case .neutral: neutralDuration
+        case .brainrot: driftDuration
+        }
+    }
+}
+
+struct ScreenTimeActivitySummary: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let kind: ActivitySourceKind
+    let classification: ProductivityClassification
+    let duration: TimeInterval
+    let sessionCount: Int
 }
 
 @MainActor
@@ -45,8 +107,6 @@ final class ScreenTimeTracker: ObservableObject {
 
     private let sampleInterval: TimeInterval = 5
     private let retentionInterval: TimeInterval = 90 * 24 * 60 * 60
-    private let enabledKey = "personal-dashboard.screen-time-enabled.v1"
-    private let defaults: UserDefaults
     private let workspace: NSWorkspace
     private var timer: Timer?
     private var lastSampleAt: Date?
@@ -54,8 +114,7 @@ final class ScreenTimeTracker: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(defaults: UserDefaults = .standard, workspace: NSWorkspace = .shared) {
-        self.defaults = defaults
+    init(workspace: NSWorkspace = .shared) {
         self.workspace = workspace
         encoder = JSONEncoder()
         decoder = JSONDecoder()
@@ -63,31 +122,19 @@ final class ScreenTimeTracker: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         loadSessions()
         removeExpiredSessions()
-        if defaults.bool(forKey: enabledKey) { startTracking() }
+        startTracking()
     }
 
     deinit { timer?.invalidate() }
 
-    func startTracking() {
+    private func startTracking() {
         guard !isTracking else { return }
         isTracking = true
-        defaults.set(true, forKey: enabledKey)
         recordSample()
         timer = Timer(timeInterval: sampleInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.recordSample() }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
-    }
-
-    func stopTracking() {
-        guard isTracking else { return }
-        finishCurrentSession(at: Date())
-        timer?.invalidate()
-        timer = nil
-        lastSampleAt = nil
-        activeSessionID = nil
-        isTracking = false
-        defaults.set(false, forKey: enabledKey)
     }
 
     func clearHistory() {
@@ -115,9 +162,14 @@ final class ScreenTimeTracker: ObservableObject {
         formatDuration(duration(for: date), includeMinutesLabel: true)
     }
 
-    func chartSegments(for date: Date) -> [ScreenTimeChartSegment] {
+    func chartSegments(
+        for date: Date,
+        classificationRules: [ActivityClassificationRule]
+    ) -> [ScreenTimeChartSegment] {
         let interval = trackingInterval(for: date)
         var segments: [ScreenTimeChartSegment] = []
+        let bucketMinutes = 5
+        let bucketCount = 60 / bucketMinutes
 
         for index in 0..<24 {
             guard let start = Calendar.current.date(byAdding: .hour, value: index, to: interval.start),
@@ -125,6 +177,15 @@ final class ScreenTimeTracker: ObservableObject {
                 continue
             }
             let hour = DateInterval(start: start, end: min(end, interval.end))
+            var durationByBucket = Array(repeating: TimeInterval.zero, count: bucketCount)
+            var earliestMinuteByBucket = Array(repeating: 60.0, count: bucketCount)
+            var latestMinuteByBucket = Array(repeating: Double.zero, count: bucketCount)
+            var activityByBucket = Array(repeating: [String: TimeInterval](), count: bucketCount)
+            var classificationByBucket = Array(
+                repeating: [ProductivityClassification: TimeInterval](),
+                count: bucketCount
+            )
+
             for session in sessions {
                 let segmentStart = max(session.startedAt, hour.start)
                 let segmentEnd = min(session.endedAt, hour.end)
@@ -132,18 +193,209 @@ final class ScreenTimeTracker: ObservableObject {
 
                 let startMinute = segmentStart.timeIntervalSince(hour.start) / 60
                 let endMinute = segmentEnd.timeIntervalSince(hour.start) / 60
-                segments.append(
-                    ScreenTimeChartSegment(
-                        id: "\(session.id.uuidString)-\(index)",
-                        hourIndex: index,
-                        startMinute: max(0, min(60, startMinute)),
-                        endMinute: max(0, min(60, endMinute)),
-                        activityName: session.websiteDomain ?? session.appName
+                let firstBucket = max(0, min(bucketCount - 1, Int(startMinute / Double(bucketMinutes))))
+                let lastBucket = max(0, min(bucketCount - 1, Int(endMinute.nextDown / Double(bucketMinutes))))
+                let activityName = session.websiteDomain ?? session.appName
+                let classification = classification(for: session, rules: classificationRules)
+
+                for bucket in firstBucket...lastBucket {
+                    let bucketStart = hour.start.addingTimeInterval(Double(bucket * bucketMinutes * 60))
+                    let bucketEnd = min(hour.end, bucketStart.addingTimeInterval(Double(bucketMinutes * 60)))
+                    let overlapStart = max(segmentStart, bucketStart)
+                    let overlapEnd = min(segmentEnd, bucketEnd)
+                    let occupied = max(0, overlapEnd.timeIntervalSince(overlapStart))
+                    durationByBucket[bucket] += occupied
+                    earliestMinuteByBucket[bucket] = min(
+                        earliestMinuteByBucket[bucket],
+                        overlapStart.timeIntervalSince(hour.start) / 60
                     )
-                )
+                    latestMinuteByBucket[bucket] = max(
+                        latestMinuteByBucket[bucket],
+                        overlapEnd.timeIntervalSince(hour.start) / 60
+                    )
+                    activityByBucket[bucket][activityName, default: 0] += occupied
+                    classificationByBucket[bucket][classification, default: 0] += occupied
+                }
+            }
+
+            var firstBucket = 0
+            while firstBucket < bucketCount {
+                guard durationByBucket[firstBucket] > 0 else {
+                    firstBucket += 1
+                    continue
+                }
+
+                var endBucket = firstBucket
+                while endBucket + 1 < bucketCount, durationByBucket[endBucket + 1] > 0 {
+                    endBucket += 1
+                }
+
+                struct ClassificationChunk {
+                    let classification: ProductivityClassification
+                    let firstBucket: Int
+                    var lastBucket: Int
+                    var duration: TimeInterval
+                    var earliestMinute: Double
+                    var latestMinute: Double
+                    var activityDurations: [String: TimeInterval]
+                }
+
+                var chunks: [ClassificationChunk] = []
+                for bucket in firstBucket...endBucket {
+                    let bucketClassification = classificationByBucket[bucket]
+                        .max(by: { $0.value < $1.value })?.key ?? .neutral
+                    if chunks.last?.classification == bucketClassification {
+                        let lastIndex = chunks.count - 1
+                        chunks[lastIndex].lastBucket = bucket
+                        chunks[lastIndex].duration += durationByBucket[bucket]
+                        chunks[lastIndex].earliestMinute = min(
+                            chunks[lastIndex].earliestMinute,
+                            earliestMinuteByBucket[bucket]
+                        )
+                        chunks[lastIndex].latestMinute = max(
+                            chunks[lastIndex].latestMinute,
+                            latestMinuteByBucket[bucket]
+                        )
+                        for (name, duration) in activityByBucket[bucket] {
+                            chunks[lastIndex].activityDurations[name, default: 0] += duration
+                        }
+                    } else {
+                        chunks.append(ClassificationChunk(
+                            classification: bucketClassification,
+                            firstBucket: bucket,
+                            lastBucket: bucket,
+                            duration: durationByBucket[bucket],
+                            earliestMinute: earliestMinuteByBucket[bucket],
+                            latestMinute: latestMinuteByBucket[bucket],
+                            activityDurations: activityByBucket[bucket]
+                        ))
+                    }
+                }
+
+                let latestMinute = chunks.map(\.latestMinute).max() ?? 0
+                let totalDuration = chunks.reduce(0) { $0 + $1.duration }
+                let availableDuration = max(0, (latestMinute - Double(firstBucket * bucketMinutes)) * 60)
+                let displayedDuration = min(totalDuration, availableDuration)
+                let durationScale = totalDuration > 0 ? displayedDuration / totalDuration : 0
+                var cursorMinute = latestMinute - displayedDuration / 60
+
+                for chunk in chunks {
+                    let chunkDuration = chunk.duration * durationScale
+                    let chunkEndMinute = cursorMinute + chunkDuration / 60
+                    let dominantActivity = chunk.activityDurations
+                        .max(by: { $0.value < $1.value })?.key ?? "Tracked activity"
+                    segments.append(ScreenTimeChartSegment(
+                        id: "hour-\(index)-buckets-\(chunk.firstBucket)-\(chunk.lastBucket)-\(chunk.classification.rawValue)",
+                        hourIndex: index,
+                        startMinute: cursorMinute,
+                        endMinute: chunkEndMinute,
+                        activityWindowStartMinute: chunk.earliestMinute,
+                        activityWindowEndMinute: chunk.latestMinute,
+                        trackedDuration: chunkDuration,
+                        activityName: dominantActivity,
+                        classification: chunk.classification
+                    ))
+                    cursorMinute = chunkEndMinute
+                }
+
+                firstBucket = endBucket + 1
             }
         }
         return segments
+    }
+
+    func productivitySummary(
+        for date: Date,
+        classificationRules: [ActivityClassificationRule]
+    ) -> ScreenTimeProductivitySummary {
+        let durations = classificationDurations(for: date, rules: classificationRules)
+        return ScreenTimeProductivitySummary(
+            focusDuration: durations[.flow, default: 0],
+            neutralDuration: durations[.neutral, default: 0],
+            driftDuration: durations[.brainrot, default: 0]
+        )
+    }
+
+    func focusDriftPoints(
+        for date: Date,
+        classificationRules: [ActivityClassificationRule]
+    ) -> [FocusDriftPoint] {
+        let day = trackingInterval(for: date)
+        let relevantSessions = sessions.filter { overlap(of: $0, with: day) > 0 }
+        guard let latestEnd = relevantSessions.map({ min($0.endedAt, day.end) }).max() else { return [] }
+
+        let windowDuration: TimeInterval = 30 * 60
+        let lastWindow = min(47, max(0, Int(latestEnd.timeIntervalSince(day.start) / windowDuration)))
+        var focusScore = 0.0
+        var driftScore = 0.0
+        var points = [FocusDriftPoint(windowIndex: 0, focusScore: 0, driftScore: 0)]
+
+        for windowIndex in 0...lastWindow {
+            let start = day.start.addingTimeInterval(Double(windowIndex) * windowDuration)
+            let end = min(day.end, start.addingTimeInterval(windowDuration))
+            let window = DateInterval(start: start, end: end)
+            var focusDuration: TimeInterval = 0
+            var driftDuration: TimeInterval = 0
+
+            for session in relevantSessions {
+                let duration = overlap(of: session, with: window)
+                guard duration > 0 else { continue }
+                switch classification(for: session, rules: classificationRules) {
+                case .flow: focusDuration += duration
+                case .neutral: break
+                case .brainrot: driftDuration += duration
+                }
+            }
+
+            let netMinutes = (focusDuration - driftDuration) / 60
+            focusScore = min(30, max(0, focusScore + netMinutes))
+            driftScore = min(30, max(0, driftScore - netMinutes))
+            points.append(FocusDriftPoint(
+                windowIndex: windowIndex + 1,
+                focusScore: focusScore,
+                driftScore: driftScore
+            ))
+        }
+        return points
+    }
+
+    func topActivities(
+        for date: Date,
+        classificationRules: [ActivityClassificationRule],
+        limit: Int = 3
+    ) -> [ScreenTimeActivitySummary] {
+        let day = trackingInterval(for: date)
+        var durations: [String: TimeInterval] = [:]
+        var counts: [String: Int] = [:]
+        var sources: [String: TrackedActivitySource] = [:]
+        var classifications: [String: ProductivityClassification] = [:]
+
+        for session in sessions {
+            let duration = overlap(of: session, with: day)
+            guard duration > 0 else { continue }
+            let source = source(for: session)
+            durations[source.id, default: 0] += duration
+            counts[source.id, default: 0] += 1
+            sources[source.id] = source
+            classifications[source.id] = classification(for: session, rules: classificationRules)
+        }
+
+        return durations
+            .sorted { lhs, rhs in
+                lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value
+            }
+            .prefix(max(0, limit))
+            .compactMap { id, duration in
+                guard let source = sources[id], let classification = classifications[id] else { return nil }
+                return ScreenTimeActivitySummary(
+                    id: id,
+                    name: source.displayName,
+                    kind: source.kind,
+                    classification: classification,
+                    duration: duration,
+                    sessionCount: counts[id, default: 0]
+                )
+            }
     }
 
     func trackingDay(containing moment: Date) -> Date {
@@ -175,7 +427,74 @@ final class ScreenTimeTracker: ObservableObject {
         formatDuration(duration, includeMinutesLabel: false)
     }
 
+    var knownSources: [TrackedActivitySource] {
+        var sources: [String: TrackedActivitySource] = [:]
+        for session in sessions.reversed() {
+            let source: TrackedActivitySource
+            if let domain = session.websiteDomain, !domain.isEmpty {
+                source = TrackedActivitySource(
+                    displayName: domain,
+                    identifier: domain,
+                    kind: .website
+                )
+            } else {
+                source = TrackedActivitySource(
+                    displayName: session.appName,
+                    identifier: session.bundleIdentifier,
+                    kind: .application
+                )
+            }
+            sources[source.id] = sources[source.id] ?? source
+        }
+        return sources.values.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
     var storagePath: String { storageURL.path }
+
+    private func classificationDurations(
+        for date: Date,
+        rules: [ActivityClassificationRule]
+    ) -> [ProductivityClassification: TimeInterval] {
+        let day = trackingInterval(for: date)
+        var durations: [ProductivityClassification: TimeInterval] = [:]
+        for session in sessions {
+            let duration = overlap(of: session, with: day)
+            guard duration > 0 else { continue }
+            durations[classification(for: session, rules: rules), default: 0] += duration
+        }
+        return durations
+    }
+
+    private func source(for session: ScreenTimeSession) -> TrackedActivitySource {
+        if let domain = session.websiteDomain, !domain.isEmpty {
+            return TrackedActivitySource(displayName: domain, identifier: domain, kind: .website)
+        }
+        return TrackedActivitySource(
+            displayName: session.appName,
+            identifier: session.bundleIdentifier,
+            kind: .application
+        )
+    }
+
+    private func classification(
+        for session: ScreenTimeSession,
+        rules: [ActivityClassificationRule]
+    ) -> ProductivityClassification {
+        let source = source(for: session)
+        return rules.first { rule in
+            guard rule.kind == source.kind else { return false }
+            if rule.kind == .website {
+                let domain = source.identifier.lowercased()
+                let configured = rule.identifier.lowercased()
+                return domain == configured || domain.hasSuffix(".\(configured)")
+            }
+            return rule.identifier.caseInsensitiveCompare(source.identifier) == .orderedSame
+                || rule.identifier.caseInsensitiveCompare(source.displayName) == .orderedSame
+                || rule.displayName.caseInsensitiveCompare(source.displayName) == .orderedSame
+        }?.classification ?? .neutral
+    }
 
     private func recordSample(now: Date = Date()) {
         removeExpiredSessions(now: now)
@@ -224,8 +543,7 @@ final class ScreenTimeTracker: ObservableObject {
 
     private func currentActivity() -> ActivityIdentity? {
         guard let application = workspace.frontmostApplication,
-              let bundleIdentifier = application.bundleIdentifier,
-              bundleIdentifier != Bundle.main.bundleIdentifier else { return nil }
+              let bundleIdentifier = application.bundleIdentifier else { return nil }
         return ActivityIdentity(
             appName: application.localizedName ?? bundleIdentifier,
             bundleIdentifier: bundleIdentifier,
@@ -288,7 +606,7 @@ final class ScreenTimeTracker: ObservableObject {
         if includeMinutesLabel { return "\(hours)h \(minutes)min" }
         if hours > 0 { return "\(hours)h \(minutes)m" }
         if totalMinutes > 0 { return "\(totalMinutes)m" }
-        return "<1m"
+        return duration > 0 ? "<1m" : "0m"
     }
 
     private var storageURL: URL {

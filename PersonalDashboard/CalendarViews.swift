@@ -11,8 +11,10 @@ struct CalendarPanel: View {
     @EnvironmentObject private var store: DashboardStore
     @State private var displayedMonth = Calendar.current.startOfMonth(containing: Date())
     @State private var selectedDate = Date()
+    @State private var hasSelectedDate = false
     @State private var displayMode: CalendarDisplayMode = .month
     @State private var showingAddEvent = false
+    @State private var isAgendaVisible = false
 
     private let calendar = Calendar.current
 
@@ -20,7 +22,7 @@ struct CalendarPanel: View {
         VStack(spacing: 0) {
             calendarToolbar
             Divider().overlay(Palette.grid)
-                .padding(.horizontal, 26)
+                .padding(.horizontal, 10)
 
             HStack(alignment: .top, spacing: 18) {
                 Group {
@@ -28,23 +30,31 @@ struct CalendarPanel: View {
                         MonthCalendarGrid(
                             displayedMonth: displayedMonth,
                             selectedDate: $selectedDate,
-                            events: store.calendarEvents
+                            hasSelectedDate: $hasSelectedDate,
+                            events: store.calendarEvents,
+                            onSelectDate: { isAgendaVisible = true }
                         )
                     } else {
                         WeekCalendarGrid(
                             selectedDate: $selectedDate,
-                            events: store.calendarEvents
+                            hasSelectedDate: $hasSelectedDate,
+                            events: store.calendarEvents,
+                            onSelectDate: { isAgendaVisible = true }
                         )
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                DayAgendaPanel(selectedDate: selectedDate) {
-                    showingAddEvent = true
+                if isAgendaVisible {
+                    DayAgendaPanel(selectedDate: selectedDate) {
+                        showingAddEvent = true
+                    }
+                    .frame(width: 280)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                .frame(width: 280)
             }
-            .padding(18)
+            .padding(6)
+            .animation(.easeInOut(duration: 0.18), value: isAgendaVisible)
         }
         .background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -55,10 +65,10 @@ struct CalendarPanel: View {
     }
 
     private var calendarToolbar: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(displayedMonth.formatted(.dateTime.month(.wide).year()))
-                    .font(.system(size: 24, weight: .bold))
+                    .font(.system(size: 22, weight: .bold))
                 Text(displayMode == .month ? "Month overview" : "Week overview")
                     .font(.system(size: 11))
                     .foregroundStyle(Palette.muted)
@@ -70,6 +80,8 @@ struct CalendarPanel: View {
             }
             Button("Today") {
                 selectedDate = Date()
+                hasSelectedDate = true
+                isAgendaVisible = true
                 displayedMonth = calendar.startOfMonth(containing: Date())
             }
             .buttonStyle(.plain)
@@ -83,17 +95,39 @@ struct CalendarPanel: View {
                 move(by: 1)
             }
 
-            Picker("View", selection: $displayMode) {
+            HStack(spacing: 0) {
                 ForEach(CalendarDisplayMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+                    CalendarModeButton(title: mode.rawValue, selected: displayMode == mode) {
+                        displayMode = mode
+                    }
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 186)
+            .padding(4)
+            .frame(width: 174)
+            .background(Palette.track)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Button {
+                if isAgendaVisible {
+                    hasSelectedDate = false
+                    isAgendaVisible = false
+                } else {
+                    hasSelectedDate = true
+                    isAgendaVisible = true
+                }
+            } label: {
+                Image(systemName: isAgendaVisible ? "sidebar.trailing" : "sidebar.trailing")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .background(isAgendaVisible ? Palette.selected : Palette.panel)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.grid, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .help(isAgendaVisible ? "Hide day details" : "Show day details")
         }
-        .padding(.horizontal, 26)
-        .padding(.vertical, 18)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
     }
 
     private func move(by value: Int) {
@@ -104,6 +138,25 @@ struct CalendarPanel: View {
             selectedDate = calendar.date(byAdding: .weekOfYear, value: value, to: selectedDate) ?? selectedDate
             displayedMonth = calendar.startOfMonth(containing: selectedDate)
         }
+    }
+}
+
+private struct CalendarModeButton: View {
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(selected ? Color.white : Palette.muted)
+                .frame(maxWidth: .infinity)
+                .frame(height: 28)
+                .background(selected ? Palette.ink : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -129,7 +182,9 @@ private struct CalendarToolbarButton: View {
 private struct MonthCalendarGrid: View {
     let displayedMonth: Date
     @Binding var selectedDate: Date
+    @Binding var hasSelectedDate: Bool
     let events: [CalendarEvent]
+    let onSelectDate: () -> Void
 
     private let calendar = Calendar.current
     private let weekdayLabels = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
@@ -152,7 +207,7 @@ private struct MonthCalendarGrid: View {
                         .frame(maxWidth: .infinity)
                 }
             }
-            .frame(height: 38)
+            .frame(height: 22)
 
             GeometryReader { proxy in
                 let cellHeight = proxy.size.height / 6
@@ -164,13 +219,16 @@ private struct MonthCalendarGrid: View {
                                 MonthDayCell(
                                     date: date,
                                     isCurrentMonth: calendar.isDate(date, equalTo: displayedMonth, toGranularity: .month),
-                                    isSelected: calendar.isDate(date, inSameDayAs: selectedDate),
+                                    isSelected: hasSelectedDate && calendar.isDate(date, inSameDayAs: selectedDate),
+                                    isToday: calendar.isDateInToday(date),
                                     events: events.filter { calendar.isDate($0.startAt, inSameDayAs: date) }
                                 ) {
                                     selectedDate = date
+                                    hasSelectedDate = true
+                                    onSelectDate()
                                 }
-                                .frame(maxWidth: .infinity)
-                                .frame(height: cellHeight)
+                                .frame(maxWidth: .infinity, minHeight: cellHeight, maxHeight: cellHeight)
+                                .clipped()
                             }
                         }
                     }
@@ -187,35 +245,39 @@ private struct MonthDayCell: View {
     let date: Date
     let isCurrentMonth: Bool
     let isSelected: Bool
+    let isToday: Bool
     let events: [CalendarEvent]
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(date.formatted(.dateTime.day()))
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(isSelected ? Color.white : (isCurrentMonth ? Palette.ink : Palette.muted.opacity(0.55)))
-                    .frame(width: 30, height: 30)
-                    .background(isSelected ? Palette.ink : Color.clear)
-                    .clipShape(Circle())
+        VStack(alignment: .leading, spacing: 3) {
+            Text(date.formatted(.dateTime.day()))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle((isSelected || isToday) ? Color.white : (isCurrentMonth ? Palette.ink : Palette.muted.opacity(0.55)))
+                .frame(width: 22, height: 22)
+                .background(isSelected ? Palette.ink : (isToday ? Palette.warning : Color.clear))
+                .clipShape(Circle())
 
-                ForEach(Array(events.prefix(2))) { event in
-                    EventChip(event: event)
+            if !events.isEmpty {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 3) {
+                        ForEach(events) { event in
+                            EventChip(event: event)
+                        }
+                    }
                 }
-                if events.count > 2 {
-                    Text("+\(events.count - 2) more")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Palette.muted)
-                        .padding(.leading, 4)
-                }
-                Spacer(minLength: 0)
+                .scrollIndicators(.hidden)
             }
-            .padding(8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .contentShape(Rectangle())
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
+        .padding(.top, 3)
+        .padding(.leading, 4)
+        .padding(.trailing, 3)
+        .padding(.bottom, 3)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
+        .clipped()
         .overlay(alignment: .topTrailing) {
             Rectangle().fill(Palette.grid).frame(width: 1)
         }
@@ -237,7 +299,7 @@ private struct EventChip: View {
             Spacer(minLength: 0)
         }
         .padding(.trailing, 5)
-        .frame(height: 24)
+        .frame(height: 20)
         .background(event.color.background)
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
@@ -245,7 +307,9 @@ private struct EventChip: View {
 
 private struct WeekCalendarGrid: View {
     @Binding var selectedDate: Date
+    @Binding var hasSelectedDate: Bool
     let events: [CalendarEvent]
+    let onSelectDate: () -> Void
     private let calendar = Calendar.current
     private let startHour = 6
     private let endHour = 23
@@ -266,16 +330,20 @@ private struct WeekCalendarGrid: View {
             HStack(spacing: 0) {
                 Color.clear.frame(width: timeColumnWidth)
                 ForEach(dates, id: \.self) { date in
-                    Button { selectedDate = date } label: {
+                    Button {
+                        selectedDate = date
+                        hasSelectedDate = true
+                        onSelectDate()
+                    } label: {
                         VStack(spacing: 4) {
                             Text(date.formatted(.dateTime.weekday(.abbreviated)))
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundStyle(Palette.muted)
                             Text(date.formatted(.dateTime.day()))
                                 .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(calendar.isDate(date, inSameDayAs: selectedDate) ? Color.white : Palette.ink)
+                                .foregroundStyle(dayMarkerColor(for: date))
                                 .frame(width: 30, height: 30)
-                                .background(calendar.isDate(date, inSameDayAs: selectedDate) ? Palette.ink : Color.clear)
+                                .background(dayMarkerBackground(for: date))
                                 .clipShape(Circle())
                         }
                         .frame(maxWidth: .infinity)
@@ -294,11 +362,18 @@ private struct WeekCalendarGrid: View {
                     ZStack(alignment: .topLeading) {
                         ForEach(startHour...endHour, id: \.self) { hour in
                             let y = CGFloat(hour - startHour) * hourHeight
+                            let labelY = if hour == startHour {
+                                y + 4
+                            } else if hour == endHour {
+                                y - 16
+                            } else {
+                                y - 6
+                            }
                             Text(hourLabel(hour))
                                 .font(.system(size: 9))
                                 .foregroundStyle(Palette.muted)
                                 .frame(width: timeColumnWidth - 8, alignment: .trailing)
-                                .offset(y: y - 6)
+                                .offset(y: labelY)
                             Rectangle()
                                 .fill(Palette.grid)
                                 .frame(width: proxy.size.width - timeColumnWidth, height: 1)
@@ -316,7 +391,11 @@ private struct WeekCalendarGrid: View {
                             let dayEvents = events.filter { calendar.isDate($0.startAt, inSameDayAs: date) }
                             ForEach(dayEvents) { event in
                                 if let placement = placement(for: event, on: date) {
-                                    Button { selectedDate = date } label: {
+                                    Button {
+                                        selectedDate = date
+                                        hasSelectedDate = true
+                                        onSelectDate()
+                                    } label: {
                                         WeekEventBlock(event: event)
                                     }
                                     .buttonStyle(.plain)
@@ -337,7 +416,19 @@ private struct WeekCalendarGrid: View {
         .background(Palette.panel)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.grid, lineWidth: 1))
-        .padding(10)
+        .padding(8)
+    }
+
+    private func dayMarkerBackground(for date: Date) -> Color {
+        if hasSelectedDate && calendar.isDate(date, inSameDayAs: selectedDate) { return Palette.ink }
+        if calendar.isDateInToday(date) { return Palette.warning }
+        return .clear
+    }
+
+    private func dayMarkerColor(for date: Date) -> Color {
+        (hasSelectedDate && calendar.isDate(date, inSameDayAs: selectedDate)) || calendar.isDateInToday(date)
+            ? .white
+            : Palette.ink
     }
 
     private func placement(for event: CalendarEvent, on date: Date) -> (y: CGFloat, height: CGFloat)? {
@@ -537,8 +628,8 @@ private struct AddCalendarEventSheet: View {
             TextField("Event name", text: $title)
                 .textFieldStyle(.roundedBorder)
                 .focused($titleFocused)
-            DatePicker("Starts", selection: $startAt)
-            DatePicker("Ends", selection: $endAt, in: startAt...)
+            eventDateRow("Starts", selection: $startAt)
+            eventDateRow("Ends", selection: $endAt, range: startAt...)
             TextField("Notes (optional)", text: $notes)
                 .textFieldStyle(.roundedBorder)
             Picker("Color", selection: $color) {
@@ -569,6 +660,39 @@ private struct AddCalendarEventSheet: View {
         .onAppear { titleFocused = true }
         .onChange(of: startAt) { _, newStart in
             if endAt <= newStart { endAt = newStart.addingTimeInterval(60 * 60) }
+        }
+    }
+
+    private func eventDateRow(
+        _ label: String,
+        selection: Binding<Date>,
+        range: PartialRangeFrom<Date>? = nil
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 46, alignment: .leading)
+
+            if let range {
+                DatePicker("", selection: selection, in: range, displayedComponents: .date)
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .frame(width: 136)
+                DatePicker("", selection: selection, in: range, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .frame(width: 104)
+            } else {
+                DatePicker("", selection: selection, displayedComponents: .date)
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .frame(width: 136)
+                DatePicker("", selection: selection, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .datePickerStyle(.field)
+                    .frame(width: 104)
+            }
+            Spacer(minLength: 0)
         }
     }
 }
