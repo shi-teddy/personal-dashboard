@@ -35,6 +35,8 @@ struct ContentView: View {
                         StickyNotesBoard()
                     } else if page == .settings {
                         ClassificationSettingsView()
+                    } else if page == .insights {
+                        InsightsPage()
                     } else {
                         EmptyPage(page: page)
                     }
@@ -126,7 +128,10 @@ private enum DashboardMode {
 }
 
 private struct DashboardHeader: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
     @Binding var selectedMode: DashboardMode
+    @State private var didRefresh = false
+    @State private var refreshResetTask: Task<Void, Never>?
 
     var body: some View {
         HStack {
@@ -140,16 +145,35 @@ private struct DashboardHeader: View {
             .padding(4).background(Palette.track)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             if selectedMode == .screenTime {
-                HStack(spacing: 6) {
-                    Circle().fill(Palette.focus).frame(width: 7, height: 7)
-                    Text("Tracking")
+                Button {
+                    tracker.refresh()
+                    refreshResetTask?.cancel()
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        didRefresh = true
+                    }
+                    refreshResetTask = Task {
+                        try? await Task.sleep(nanoseconds: 1_200_000_000)
+                        guard !Task.isCancelled else { return }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            didRefresh = false
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle().fill(Palette.focus).frame(width: 7, height: 7)
+                        Text(didRefresh ? "Updated" : "Tracking")
+                        Image(systemName: didRefresh ? "checkmark" : "arrow.clockwise")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 12).frame(height: 36)
+                    .background(Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
                 }
-                .font(.system(size: 12, weight: .semibold))
-                .padding(.horizontal, 12).frame(height: 36)
-                .background(Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
-                .help("Tracking active apps and browser domains locally while Personal Dashboard is open")
+                .buttonStyle(.plain)
+                .help("Tracking is active. Click to refresh screen-time data and classifications.")
+                .accessibilityLabel("Tracking active. Refresh screen time")
             }
         }
         .padding(.horizontal, 28).padding(.vertical, 16)
@@ -614,6 +638,391 @@ private struct TopActivityRow: View {
     }
 }
 
+private struct InsightDaySummary: Identifiable {
+    let date: Date
+    let productivity: ScreenTimeProductivitySummary
+
+    var id: Date { date }
+}
+
+private struct InsightActivityTotal: Identifiable {
+    let id: String
+    let name: String
+    let kind: ActivitySourceKind
+    let classification: ProductivityClassification
+    var duration: TimeInterval
+}
+
+private struct InsightsPage: View {
+    @EnvironmentObject private var store: DashboardStore
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    @State private var anchorDate = Date()
+    private let calendar = Calendar.current
+
+    private var days: [InsightDaySummary] {
+        let end = tracker.trackingDay(containing: anchorDate)
+        return (-6...0).compactMap { offset in
+            guard let date = calendar.date(byAdding: .day, value: offset, to: end) else { return nil }
+            return InsightDaySummary(
+                date: date,
+                productivity: tracker.productivitySummary(
+                    for: date,
+                    classificationRules: store.classificationRules
+                )
+            )
+        }
+    }
+
+    private var totalSummary: ScreenTimeProductivitySummary {
+        days.reduce(ScreenTimeProductivitySummary(focusDuration: 0, neutralDuration: 0, driftDuration: 0)) {
+            ScreenTimeProductivitySummary(
+                focusDuration: $0.focusDuration + $1.productivity.focusDuration,
+                neutralDuration: $0.neutralDuration + $1.productivity.neutralDuration,
+                driftDuration: $0.driftDuration + $1.productivity.driftDuration
+            )
+        }
+    }
+
+    private var averageScore: Int {
+        let activeDays = days.filter { $0.productivity.totalDuration > 0 }
+        guard !activeDays.isEmpty else { return 0 }
+        return activeDays.reduce(0) { $0 + $1.productivity.score } / activeDays.count
+    }
+
+    private var bestDay: InsightDaySummary? {
+        days.filter { $0.productivity.totalDuration > 0 }
+            .max { $0.productivity.score < $1.productivity.score }
+    }
+
+    private var topActivities: [InsightActivityTotal] {
+        var totals: [String: InsightActivityTotal] = [:]
+        for day in days {
+            for activity in tracker.topActivities(
+                for: day.date,
+                classificationRules: store.classificationRules,
+                limit: 1_000
+            ) {
+                if var existing = totals[activity.id] {
+                    existing.duration += activity.duration
+                    totals[activity.id] = existing
+                } else {
+                    totals[activity.id] = InsightActivityTotal(
+                        id: activity.id,
+                        name: activity.name,
+                        kind: activity.kind,
+                        classification: activity.classification,
+                        duration: activity.duration
+                    )
+                }
+            }
+        }
+        return Array(totals.values)
+            .sorted { $0.duration == $1.duration ? $0.name < $1.name : $0.duration > $1.duration }
+            .prefix(5)
+            .map { $0 }
+    }
+
+    var body: some View {
+        let summary = totalSummary
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Insights").font(.system(size: 26, weight: .bold))
+                    Text(rangeLabel).font(.system(size: 12)).foregroundStyle(Palette.muted)
+                }
+                Spacer()
+                InsightNavigationButton(symbol: "chevron.left", help: "Previous week") { moveWeek(-1) }
+                Button("This week") { anchorDate = Date() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 82, height: 34)
+                    .background(Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(Palette.border, lineWidth: 1))
+                InsightNavigationButton(symbol: "chevron.right", help: "Next week") { moveWeek(1) }
+            }
+
+            HStack(spacing: 14) {
+                InsightMetricCard(
+                    title: "Total screen time",
+                    value: tracker.shortDuration(summary.totalDuration),
+                    detail: "Across seven days",
+                    symbol: "clock"
+                )
+                InsightMetricCard(
+                    title: "Flow time",
+                    value: tracker.shortDuration(summary.focusDuration),
+                    detail: percentageDetail(summary.focusDuration, total: summary.totalDuration),
+                    symbol: "bolt.fill"
+                )
+                InsightMetricCard(
+                    title: "Average score",
+                    value: "\(averageScore)%",
+                    detail: "On active days",
+                    symbol: "gauge.with.dots.needle.50percent"
+                )
+                InsightMetricCard(
+                    title: "Best day",
+                    value: bestDay?.date.formatted(.dateTime.weekday(.abbreviated)) ?? "—",
+                    detail: bestDay.map { "\($0.productivity.score)% productivity" } ?? "No activity yet",
+                    symbol: "trophy"
+                )
+            }
+            .frame(height: 112)
+
+            HStack(alignment: .top, spacing: 18) {
+                InsightTrendCard(days: days)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(spacing: 18) {
+                    InsightBreakdownCard(summary: summary)
+                    InsightTopActivitiesCard(activities: topActivities)
+                }
+                .frame(width: 350)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Palette.panel)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
+    }
+
+    private var rangeLabel: String {
+        guard let first = days.first?.date, let last = days.last?.date else { return "Last 7 days" }
+        return "\(first.formatted(.dateTime.month(.abbreviated).day())) – \(last.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+
+    private func moveWeek(_ offset: Int) {
+        anchorDate = calendar.date(byAdding: .day, value: offset * 7, to: anchorDate) ?? anchorDate
+    }
+
+    private func percentageDetail(_ value: TimeInterval, total: TimeInterval) -> String {
+        guard total > 0 else { return "No classified time" }
+        return "\(Int((value / total * 100).rounded()))% of tracked time"
+    }
+}
+
+private struct InsightNavigationButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 34, height: 34)
+                .background(Palette.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(Palette.border, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+private struct InsightMetricCard: View {
+    let title: String
+    let value: String
+    let detail: String
+    let symbol: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.muted)
+                Spacer()
+                Image(systemName: symbol).font(.system(size: 12)).foregroundStyle(Palette.focus)
+            }
+            Text(value).font(.system(size: 24, weight: .bold)).monospacedDigit()
+            Text(detail).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(1)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+private struct InsightTrendCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let days: [InsightDaySummary]
+
+    private var maximumDuration: TimeInterval {
+        max(1, days.map(\.productivity.totalDuration).max() ?? 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Daily activity").font(.system(size: 17, weight: .semibold))
+                    Text("Tracked time by classification").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                }
+                Spacer()
+                HStack(spacing: 14) {
+                    InsightLegend(label: "Flow", color: Palette.focus)
+                    InsightLegend(label: "Neutral", color: Palette.neutral)
+                    InsightLegend(label: "Brainrot", color: Palette.warning)
+                }
+            }
+
+            GeometryReader { proxy in
+                let chartHeight = max(1, proxy.size.height - 42)
+                HStack(alignment: .bottom, spacing: 14) {
+                    ForEach(days) { day in
+                        VStack(spacing: 5) {
+                            Text(tracker.shortDuration(day.productivity.totalDuration))
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Palette.muted)
+                            Spacer(minLength: 0)
+                            VStack(spacing: 1) {
+                                InsightBarSegment(
+                                    color: Palette.focus,
+                                    height: chartHeight * CGFloat(day.productivity.focusDuration / maximumDuration)
+                                )
+                                InsightBarSegment(
+                                    color: Palette.neutral,
+                                    height: chartHeight * CGFloat(day.productivity.neutralDuration / maximumDuration)
+                                )
+                                InsightBarSegment(
+                                    color: Palette.warning,
+                                    height: chartHeight * CGFloat(day.productivity.driftDuration / maximumDuration)
+                                )
+                            }
+                            .frame(maxWidth: 46)
+                            Text(day.date.formatted(.dateTime.weekday(.abbreviated)))
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .padding(.top, 6)
+            }
+        }
+        .padding(18)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+private struct InsightBarSegment: View {
+    let color: Color
+    let height: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 3, style: .continuous)
+            .fill(color)
+            .frame(maxWidth: .infinity)
+            .frame(height: max(0, height))
+    }
+}
+
+private struct InsightLegend: View {
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.muted)
+        }
+    }
+}
+
+private struct InsightBreakdownCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let summary: ScreenTimeProductivitySummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Classification breakdown").font(.system(size: 16, weight: .semibold))
+            InsightBreakdownRow(name: "Flow", duration: summary.focusDuration, total: summary.totalDuration, color: Palette.focus)
+            InsightBreakdownRow(name: "Neutral", duration: summary.neutralDuration, total: summary.totalDuration, color: Palette.neutral)
+            InsightBreakdownRow(name: "Brainrot", duration: summary.driftDuration, total: summary.totalDuration, color: Palette.warning)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+private struct InsightBreakdownRow: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let name: String
+    let duration: TimeInterval
+    let total: TimeInterval
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 5) {
+            HStack {
+                Circle().fill(color).frame(width: 8, height: 8)
+                Text(name).font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text(tracker.shortDuration(duration)).font(.system(size: 10, weight: .semibold)).monospacedDigit()
+            }
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Palette.progressBackground)
+                    Capsule().fill(color).frame(width: proxy.size.width * progress)
+                }
+            }
+            .frame(height: 6)
+        }
+    }
+
+    private var progress: CGFloat {
+        guard total > 0 else { return 0 }
+        return CGFloat(duration / total)
+    }
+}
+
+private struct InsightTopActivitiesCard: View {
+    @EnvironmentObject private var tracker: ScreenTimeTracker
+    let activities: [InsightActivityTotal]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Top apps & sites").font(.system(size: 16, weight: .semibold))
+            if activities.isEmpty {
+                Text("Screen-time activity will appear here.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.muted)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ForEach(Array(activities.enumerated()), id: \.element.id) { index, activity in
+                    HStack(spacing: 9) {
+                        Text("\(index + 1)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(activity.classification.dashboardColor)
+                            .frame(width: 20, height: 20)
+                            .background(activity.classification.dashboardColor.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(activity.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                            Text("\(activity.classification.displayName) · \(activity.kind.displayName)")
+                                .font(.system(size: 8)).foregroundStyle(Palette.muted)
+                        }
+                        Spacer()
+                        Text(tracker.shortDuration(activity.duration))
+                            .font(.system(size: 10, weight: .semibold)).monospacedDigit()
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
 private struct RightColumn: View {
     var body: some View {
         VStack(spacing: 18) {
@@ -686,30 +1095,25 @@ private struct TodoCard: View {
     @State private var showingAddTodo = false
     @State private var draggedTodoID: UUID?
     @State private var todoDragOffset: CGFloat = 0
+    @State private var dividerDragStartIndex: Int?
+    @State private var dividerDragOffset: CGFloat = 0
     private var completedCount: Int { store.todos.filter(\.isCompleted).count }
+    private var activeTodoCount: Int { store.todos.filter { !$0.isCompleted }.count }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             CardHeader(title: "Todo") { showingAddTodo = true }
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    ForEach(store.todos) { todo in
-                        HStack(spacing: 10) {
-                            Button { store.toggleTodo(todo.id) } label: {
-                                Image(systemName: todo.isCompleted ? "checkmark" : "square")
-                                    .font(.system(size: 13, weight: .medium)).frame(width: 14)
-                            }.buttonStyle(.plain)
-                            Text(todo.title).font(.system(size: 14))
-                                .foregroundStyle(todo.isCompleted ? Palette.muted : Palette.ink)
-                            Spacer()
-                            Button { store.deleteTodo(todo.id) } label: { Image(systemName: "xmark").font(.system(size: 9, weight: .bold)) }
-                                .buttonStyle(.plain).foregroundStyle(Palette.muted.opacity(0.75)).help("Delete todo")
+                    ForEach(Array(store.todos.enumerated()), id: \.element.id) { index, todo in
+                        if index == store.todoDividerIndex {
+                            todoDivider
                         }
-                        .contentShape(Rectangle())
-                        .offset(y: draggedTodoID == todo.id ? todoDragOffset : 0)
-                        .zIndex(draggedTodoID == todo.id ? 1 : 0)
-                        .opacity(draggedTodoID == todo.id ? 0.86 : 1)
-                        .simultaneousGesture(todoDragGesture(for: todo.id))
-                        .help("Drag to reorder")
+                        todoRow(todo)
+                    }
+                    if store.todoDividerIndex == activeTodoCount,
+                       activeTodoCount == store.todos.count {
+                        todoDivider
                     }
                 }
             }
@@ -723,6 +1127,70 @@ private struct TodoCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
         .sheet(isPresented: $showingAddTodo) { AddTodoSheet(isPresented: $showingAddTodo) }
+    }
+
+    private func todoRow(_ todo: TodoItem) -> some View {
+        HStack(spacing: 10) {
+            Button { store.toggleTodo(todo.id) } label: {
+                Image(systemName: todo.isCompleted ? "checkmark" : "square")
+                    .font(.system(size: 13, weight: .medium)).frame(width: 14)
+            }.buttonStyle(.plain)
+            Text(todo.title).font(.system(size: 14))
+                .foregroundStyle(todo.isCompleted ? Palette.muted : Palette.ink)
+            Spacer()
+            Button { store.deleteTodo(todo.id) } label: {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Palette.muted.opacity(0.75))
+            .help("Delete todo")
+        }
+        .contentShape(Rectangle())
+        .offset(y: draggedTodoID == todo.id ? todoDragOffset : 0)
+        .zIndex(draggedTodoID == todo.id ? 1 : 0)
+        .opacity(draggedTodoID == todo.id ? 0.86 : 1)
+        .simultaneousGesture(todoDragGesture(for: todo.id))
+        .help("Drag to reorder")
+    }
+
+    private var todoDivider: some View {
+        HStack(spacing: 8) {
+            Rectangle().fill(Palette.border).frame(height: 1)
+            HStack(spacing: 5) {
+                Text("DO TODAY")
+                Image(systemName: "line.3.horizontal")
+                Text("BACKLOG")
+            }
+            .font(.system(size: 8, weight: .bold))
+            .foregroundStyle(Palette.muted)
+            Rectangle().fill(Palette.border).frame(height: 1)
+        }
+        .frame(height: 18)
+        .contentShape(Rectangle())
+        .offset(y: dividerDragOffset)
+        .zIndex(2)
+        .gesture(dividerDragGesture)
+        .help("Drag to separate Do Today tasks from the backlog")
+    }
+
+    private var dividerDragGesture: some Gesture {
+        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+            .onChanged { value in
+                if dividerDragStartIndex == nil {
+                    dividerDragStartIndex = store.todoDividerIndex
+                }
+                dividerDragOffset = value.translation.height
+            }
+            .onEnded { value in
+                let startIndex = dividerDragStartIndex ?? store.todoDividerIndex
+                let rowStride: CGFloat = 34
+                let rowDelta = Int((value.translation.height / rowStride).rounded())
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    store.setTodoDividerIndex(startIndex + rowDelta)
+                    dividerDragStartIndex = nil
+                    dividerDragOffset = 0
+                }
+            }
     }
 
     private func todoDragGesture(for id: UUID) -> some Gesture {

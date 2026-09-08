@@ -3,6 +3,7 @@ import SwiftUI
 struct ClassificationSettingsView: View {
     @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
+    @EnvironmentObject private var focusCat: FocusCatController
 
     @State private var selection: ClassificationSelection = .unclassified
     @State private var newSubgroupClassification: ProductivityClassification?
@@ -63,6 +64,9 @@ struct ClassificationSettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 5)
 
+            focusCatControl
+                .padding(.top, 16)
+
             Button { selection = .unclassified } label: {
                 HStack {
                     Label("Unclassified", systemImage: "tray")
@@ -82,7 +86,7 @@ struct ClassificationSettingsView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
             }
             .buttonStyle(.plain)
-            .padding(.top, 22)
+            .padding(.top, 14)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -95,6 +99,51 @@ struct ClassificationSettingsView: View {
         }
         .padding(22)
         .background(Palette.surface.opacity(0.5))
+    }
+
+    private var focusCatControl: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                WhiteFocusCat(pose: .sleeping, facingRight: true, phase: 0)
+                    .frame(width: 120, height: 86)
+                    .scaleEffect(0.25)
+                    .frame(width: 31, height: 24)
+                Text("Focus Cat")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { focusCat.isEnabled },
+                    set: { focusCat.setEnabled($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            }
+
+            Text(focusCat.isEnabled
+                 ? "Watches the active Chrome tab for Shorts and Instagram."
+                 : "The desktop pet and tab detection are off.")
+                .font(.system(size: 10))
+                .foregroundStyle(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Text(focusCat.statusText.isEmpty ? "Runs locally" : focusCat.statusText)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(focusCat.isEnabled ? Palette.focus : Palette.muted)
+                Spacer()
+                Button("Preview") {
+                    focusCat.previewIntervention()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10, weight: .semibold))
+                .disabled(!focusCat.isEnabled)
+            }
+        }
+        .padding(11)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Palette.border, lineWidth: 1))
     }
 
     private func classificationGroup(_ classification: ProductivityClassification) -> some View {
@@ -155,11 +204,24 @@ struct ClassificationSettingsView: View {
 
     private var unclassifiedDetail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            detailHeader(
-                kicker: "Needs review",
-                title: "Unclassified",
-                detail: "Assign detected apps and websites to a subgroup. Until then, their time counts as Neutral."
-            )
+            HStack(alignment: .top, spacing: 20) {
+                detailHeader(
+                    kicker: "Needs review",
+                    title: "Unclassified",
+                    detail: "Assign detected apps and websites to a subgroup. Until then, their time counts as Neutral."
+                )
+                Spacer()
+                if !unclassifiedSources.isEmpty {
+                    Button {
+                        tracker.clearUnclassifiedSources(unclassifiedSources)
+                    } label: {
+                        Label("Clear", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Clear the current unclassified list without deleting screen-time history")
+                }
+            }
 
             if unclassifiedSources.isEmpty {
                 settingsEmptyState(

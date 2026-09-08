@@ -4,7 +4,14 @@ import Combine
 @MainActor
 final class DashboardStore: ObservableObject {
     @Published private(set) var todos: [TodoItem] = [] {
-        didSet { save(todos, key: todoKey) }
+        didSet {
+            save(todos, key: todoKey)
+            clampTodoDividerIndex()
+            scheduleTodoCleanup()
+        }
+    }
+    @Published private(set) var todoDividerIndex = 0 {
+        didSet { defaults.set(todoDividerIndex, forKey: todoDividerKey) }
     }
     @Published private(set) var goals: [GoalItem] = [] {
         didSet { save(goals, key: goalKey) }
@@ -23,6 +30,7 @@ final class DashboardStore: ObservableObject {
     }
 
     private let todoKey = "personal-dashboard.todos.v1"
+    private let todoDividerKey = "personal-dashboard.todo-divider-index.v1"
     private let goalKey = "personal-dashboard.goals.v1"
     private let calendarKey = "personal-dashboard.calendar-events.v1"
     private let stickyNotesKey = "personal-dashboard.sticky-notes.v1"
@@ -31,6 +39,7 @@ final class DashboardStore: ObservableObject {
     private let defaults: UserDefaults
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private var todoCleanupTimer: Timer?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -42,17 +51,43 @@ final class DashboardStore: ObservableObject {
             ?? Self.defaultClassificationSubgroups
         classificationRules = load([ActivityClassificationRule].self, key: classificationRulesKey) ?? []
         removeExpiredTodos()
+        normalizeTodoOrder()
+        let activeTodoCount = todos.filter { !$0.isCompleted }.count
+        if defaults.object(forKey: todoDividerKey) != nil {
+            todoDividerIndex = defaults.integer(forKey: todoDividerKey)
+                .clamped(to: 0...activeTodoCount)
+        } else {
+            todoDividerIndex = activeTodoCount
+        }
+        scheduleTodoCleanup()
     }
+
+    deinit { todoCleanupTimer?.invalidate() }
 
     func addTodo(title: String) {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
-        todos.append(TodoItem(title: cleaned))
+        let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
+        let dividerWasAtBottom = todoDividerIndex >= activeTodoCount
+        let insertionIndex = min(todoDividerIndex, activeTodoCount)
+        todos.insert(TodoItem(title: cleaned), at: insertionIndex)
+        if dividerWasAtBottom { todoDividerIndex = activeTodoCount + 1 }
     }
 
     func toggleTodo(_ id: UUID) {
         guard let index = todos.firstIndex(where: { $0.id == id }) else { return }
-        todos[index].completedAt = todos[index].completedAt == nil ? Date() : nil
+        let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
+        let dividerWasAtBottom = todoDividerIndex >= activeTodoCount
+        var item = todos.remove(at: index)
+        item.completedAt = item.completedAt == nil ? Date() : nil
+        if item.isCompleted {
+            todos.append(item)
+        } else {
+            let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
+            let insertionIndex = min(todoDividerIndex, firstCompleted)
+            todos.insert(item, at: insertionIndex)
+            if dividerWasAtBottom { todoDividerIndex = firstCompleted + 1 }
+        }
     }
 
     func deleteTodo(_ id: UUID) {
@@ -61,7 +96,9 @@ final class DashboardStore: ObservableObject {
 
     func moveTodo(_ id: UUID, before targetID: UUID) {
         guard id != targetID,
-              let sourceIndex = todos.firstIndex(where: { $0.id == id }) else { return }
+              let sourceIndex = todos.firstIndex(where: { $0.id == id }),
+              let originalTarget = todos.first(where: { $0.id == targetID }),
+              todos[sourceIndex].isCompleted == originalTarget.isCompleted else { return }
         let item = todos.remove(at: sourceIndex)
         guard let targetIndex = todos.firstIndex(where: { $0.id == targetID }) else {
             todos.append(item)
@@ -73,15 +110,59 @@ final class DashboardStore: ObservableObject {
     func moveTodo(_ id: UUID, toIndex destinationIndex: Int) {
         guard let sourceIndex = todos.firstIndex(where: { $0.id == id }) else { return }
         let item = todos.remove(at: sourceIndex)
-        todos.insert(item, at: destinationIndex.clamped(to: 0...todos.count))
+        let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
+        let allowedRange = item.isCompleted ? firstCompleted...todos.count : 0...firstCompleted
+        todos.insert(item, at: destinationIndex.clamped(to: allowedRange))
+    }
+
+    func setTodoDividerIndex(_ index: Int) {
+        let activeTodoCount = todos.filter { !$0.isCompleted }.count
+        todoDividerIndex = index.clamped(to: 0...activeTodoCount)
     }
 
     func removeExpiredTodos(now: Date = Date()) {
         let expiration = now.addingTimeInterval(-24 * 60 * 60)
-        todos.removeAll { item in
-            guard let completedAt = item.completedAt else { return false }
-            return completedAt <= expiration
+        let remainingTodos = todos.filter { item in
+            guard let completedAt = item.completedAt else { return true }
+            return completedAt > expiration
         }
+        if remainingTodos != todos {
+            todos = remainingTodos
+        } else {
+            scheduleTodoCleanup(now: now)
+        }
+    }
+
+    /// Schedule the next removal for the exact 24-hour deadline. The view-level
+    /// minute timer remains a fallback, but expiration no longer depends on the
+    /// dashboard being visible or SwiftUI keeping that timer alive.
+    private func scheduleTodoCleanup(now: Date = Date()) {
+        todoCleanupTimer?.invalidate()
+        todoCleanupTimer = nil
+
+        guard let nextExpiration = todos.compactMap({ item in
+            item.completedAt?.addingTimeInterval(24 * 60 * 60)
+        }).min() else { return }
+
+        let timer = Timer(timeInterval: max(0.05, nextExpiration.timeIntervalSince(now)), repeats: false) {
+            [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.removeExpiredTodos()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        todoCleanupTimer = timer
+    }
+
+    private func normalizeTodoOrder() {
+        let ordered = todos.filter { !$0.isCompleted } + todos.filter(\.isCompleted)
+        if ordered != todos { todos = ordered }
+    }
+
+    private func clampTodoDividerIndex() {
+        let activeTodoCount = todos.filter { !$0.isCompleted }.count
+        let clampedIndex = todoDividerIndex.clamped(to: 0...activeTodoCount)
+        if clampedIndex != todoDividerIndex { todoDividerIndex = clampedIndex }
     }
 
     func addGoal(title: String, progress: Int) {
@@ -104,7 +185,7 @@ final class DashboardStore: ObservableObject {
         startAt: Date,
         endAt: Date,
         notes: String,
-        color: CalendarEventColor
+        tag: CalendarEventTag
     ) {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
@@ -114,8 +195,27 @@ final class DashboardStore: ObservableObject {
             startAt: startAt,
             endAt: safeEnd,
             notes: notes.trimmingCharacters(in: .whitespacesAndNewlines),
-            color: color
+            tag: tag
         ))
+        calendarEvents.sort { $0.startAt < $1.startAt }
+    }
+
+    func updateCalendarEvent(
+        _ id: UUID,
+        title: String,
+        startAt: Date,
+        endAt: Date,
+        notes: String,
+        tag: CalendarEventTag
+    ) {
+        let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let index = calendarEvents.firstIndex(where: { $0.id == id }) else { return }
+        calendarEvents[index].title = cleaned
+        calendarEvents[index].startAt = startAt
+        calendarEvents[index].endAt = max(endAt, startAt.addingTimeInterval(15 * 60))
+        calendarEvents[index].notes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        calendarEvents[index].tag = tag
         calendarEvents.sort { $0.startAt < $1.startAt }
     }
 

@@ -107,19 +107,37 @@ final class ScreenTimeTracker: ObservableObject {
 
     private let sampleInterval: TimeInterval = 5
     private let retentionInterval: TimeInterval = 90 * 24 * 60 * 60
+    private let clearedSourcesKey = "personal-dashboard.cleared-unclassified-sources.v1"
     private let workspace: NSWorkspace
+    private let defaults: UserDefaults
     private var timer: Timer?
     private var lastSampleAt: Date?
     private var activeSessionID: UUID?
+    private var clearedSourceCutoffs: [String: Date] = [:]
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(workspace: NSWorkspace = .shared) {
+    private static let ignoredBundleIdentifiers: Set<String> = [
+        "com.apple.loginwindow",
+        "com.apple.LockScreen",
+        "com.apple.ScreenSaver.Engine",
+        "com.apple.ScreenSaver.Engine.legacy"
+    ]
+
+    private static let ignoredApplicationNames: Set<String> = [
+        "loginwindow",
+        "Lock Screen",
+        "ScreenSaverEngine"
+    ]
+
+    init(workspace: NSWorkspace = .shared, defaults: UserDefaults = .standard) {
         self.workspace = workspace
+        self.defaults = defaults
         encoder = JSONEncoder()
         decoder = JSONDecoder()
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
+        loadClearedSourceCutoffs()
         loadSessions()
         removeExpiredSessions()
         startTracking()
@@ -143,6 +161,23 @@ final class ScreenTimeTracker: ObservableObject {
         activeSessionID = nil
         saveSessions()
         if isTracking { recordSample() }
+    }
+
+    func refresh() {
+        if isTracking { recordSample() }
+        objectWillChange.send()
+    }
+
+    /// Hides the sources currently awaiting classification without deleting their
+    /// screen-time history. If one is tracked again after this cutoff, it appears
+    /// in Unclassified again so new activity is never silently ignored.
+    func clearUnclassifiedSources(_ sources: [TrackedActivitySource], now: Date = Date()) {
+        guard !sources.isEmpty else { return }
+        for source in sources {
+            clearedSourceCutoffs[source.id] = now
+        }
+        saveClearedSourceCutoffs()
+        objectWillChange.send()
     }
 
     var todayDuration: TimeInterval {
@@ -242,8 +277,9 @@ final class ScreenTimeTracker: ObservableObject {
 
                 var chunks: [ClassificationChunk] = []
                 for bucket in firstBucket...endBucket {
-                    let bucketClassification = classificationByBucket[bucket]
-                        .max(by: { $0.value < $1.value })?.key ?? .neutral
+                    let bucketClassification = dominantClassification(
+                        in: classificationByBucket[bucket]
+                    )
                     if chunks.last?.classification == bucketClassification {
                         let lastIndex = chunks.count - 1
                         chunks[lastIndex].lastBucket = bucket
@@ -282,8 +318,7 @@ final class ScreenTimeTracker: ObservableObject {
                 for chunk in chunks {
                     let chunkDuration = chunk.duration * durationScale
                     let chunkEndMinute = cursorMinute + chunkDuration / 60
-                    let dominantActivity = chunk.activityDurations
-                        .max(by: { $0.value < $1.value })?.key ?? "Tracked activity"
+                    let dominantActivity = dominantActivityName(in: chunk.activityDurations)
                     segments.append(ScreenTimeChartSegment(
                         id: "hour-\(index)-buckets-\(chunk.firstBucket)-\(chunk.lastBucket)-\(chunk.classification.rawValue)",
                         hourIndex: index,
@@ -429,7 +464,10 @@ final class ScreenTimeTracker: ObservableObject {
 
     var knownSources: [TrackedActivitySource] {
         var sources: [String: TrackedActivitySource] = [:]
+        let currentTrackingDay = trackingInterval(for: Date())
         for session in sessions.reversed() {
+            guard session.endedAt > currentTrackingDay.start,
+                  session.startedAt < currentTrackingDay.end else { continue }
             let source: TrackedActivitySource
             if let domain = session.websiteDomain, !domain.isEmpty {
                 source = TrackedActivitySource(
@@ -443,6 +481,9 @@ final class ScreenTimeTracker: ObservableObject {
                     identifier: session.bundleIdentifier,
                     kind: .application
                 )
+            }
+            if let clearedAt = clearedSourceCutoffs[source.id], session.endedAt <= clearedAt {
+                continue
             }
             sources[source.id] = sources[source.id] ?? source
         }
@@ -496,6 +537,25 @@ final class ScreenTimeTracker: ObservableObject {
         }?.classification ?? .neutral
     }
 
+    /// Dictionary iteration order is intentionally unspecified. Resolve equal-duration
+    /// buckets using the declaration order of the classifications so an unrelated
+    /// SwiftUI update can never make an old chart segment change color.
+    private func dominantClassification(
+        in durations: [ProductivityClassification: TimeInterval]
+    ) -> ProductivityClassification {
+        guard let longestDuration = durations.values.max() else { return .neutral }
+        return ProductivityClassification.allCases.first {
+            durations[$0] == longestDuration
+        } ?? .neutral
+    }
+
+    private func dominantActivityName(in durations: [String: TimeInterval]) -> String {
+        durations.sorted { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value > rhs.value }
+            return lhs.key.localizedCaseInsensitiveCompare(rhs.key) == .orderedAscending
+        }.first?.key ?? "Tracked activity"
+    }
+
     private func recordSample(now: Date = Date()) {
         removeExpiredSessions(now: now)
         if let previous = lastSampleAt, now.timeIntervalSince(previous) > sampleInterval * 3 {
@@ -544,8 +604,11 @@ final class ScreenTimeTracker: ObservableObject {
     private func currentActivity() -> ActivityIdentity? {
         guard let application = workspace.frontmostApplication,
               let bundleIdentifier = application.bundleIdentifier else { return nil }
+        let appName = application.localizedName ?? bundleIdentifier
+        guard !Self.ignoredBundleIdentifiers.contains(bundleIdentifier),
+              !Self.ignoredApplicationNames.contains(appName) else { return nil }
         return ActivityIdentity(
-            appName: application.localizedName ?? bundleIdentifier,
+            appName: appName,
             bundleIdentifier: bundleIdentifier,
             websiteDomain: activeWebsiteDomain(for: bundleIdentifier)
         )
@@ -619,6 +682,12 @@ final class ScreenTimeTracker: ObservableObject {
         guard let data = try? Data(contentsOf: storageURL) else { return }
         do {
             sessions = try decoder.decode([ScreenTimeSession].self, from: data)
+            let originalCount = sessions.count
+            sessions.removeAll { session in
+                Self.ignoredBundleIdentifiers.contains(session.bundleIdentifier)
+                    || Self.ignoredApplicationNames.contains(session.appName)
+            }
+            if sessions.count != originalCount { saveSessions() }
         } catch {
             lastError = "The saved screen-time history could not be read."
         }
@@ -634,6 +703,17 @@ final class ScreenTimeTracker: ObservableObject {
         } catch {
             lastError = "Screen-time history could not be saved."
         }
+    }
+
+    private func loadClearedSourceCutoffs() {
+        guard let data = defaults.data(forKey: clearedSourcesKey),
+              let cutoffs = try? decoder.decode([String: Date].self, from: data) else { return }
+        clearedSourceCutoffs = cutoffs
+    }
+
+    private func saveClearedSourceCutoffs() {
+        guard let data = try? encoder.encode(clearedSourceCutoffs) else { return }
+        defaults.set(data, forKey: clearedSourcesKey)
     }
 
     private func removeExpiredSessions(now: Date = Date()) {

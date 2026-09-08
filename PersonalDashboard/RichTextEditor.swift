@@ -45,6 +45,7 @@ struct RichTextEditor: NSViewRepresentable {
         scrollView.borderType = .noBorder
 
         let textView = JournalTextView()
+        textView.onFocus = context.coordinator.onFocus
         textView.delegate = context.coordinator
         textView.isRichText = true
         textView.importsGraphics = false
@@ -67,6 +68,7 @@ struct RichTextEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         context.coordinator.onChange = onChange
         context.coordinator.onFocus = onFocus
+        context.coordinator.textView?.onFocus = onFocus
         if context.coordinator.lastLoadedData != data,
            scrollView.window?.firstResponder !== context.coordinator.textView {
             context.coordinator.load(data: data)
@@ -207,6 +209,7 @@ struct RichTextEditor: NSViewRepresentable {
 }
 
 final class JournalTextView: NSTextView {
+    var onFocus: (() -> Void)?
     private let listIndent: CGFloat = 20
 
     override func keyDown(with event: NSEvent) {
@@ -216,6 +219,7 @@ final class JournalTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        onFocus?()
         let point = convert(event.locationInWindow, from: nil)
         let index = characterIndexForInsertion(at: point)
         let nsString = string as NSString

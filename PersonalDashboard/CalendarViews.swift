@@ -14,6 +14,7 @@ struct CalendarPanel: View {
     @State private var hasSelectedDate = false
     @State private var displayMode: CalendarDisplayMode = .month
     @State private var showingAddEvent = false
+    @State private var editingEvent: CalendarEvent?
     @State private var isAgendaVisible = false
 
     private let calendar = Calendar.current
@@ -46,9 +47,11 @@ struct CalendarPanel: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 if isAgendaVisible {
-                    DayAgendaPanel(selectedDate: selectedDate) {
-                        showingAddEvent = true
-                    }
+                    DayAgendaPanel(
+                        selectedDate: selectedDate,
+                        addAction: { showingAddEvent = true },
+                        editAction: { editingEvent = $0 }
+                    )
                     .frame(width: 280)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
@@ -60,7 +63,10 @@ struct CalendarPanel: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
         .sheet(isPresented: $showingAddEvent) {
-            AddCalendarEventSheet(date: selectedDate, isPresented: $showingAddEvent)
+            CalendarEventSheet(date: selectedDate)
+        }
+        .sheet(item: $editingEvent) { event in
+            CalendarEventSheet(date: event.startAt, event: event)
         }
     }
 
@@ -292,7 +298,7 @@ private struct EventChip: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Capsule().fill(event.color.tint).frame(width: 3)
+            Capsule().fill(event.tag.tint).frame(width: 3)
             Text(event.title)
                 .font(.system(size: 9, weight: .semibold))
                 .lineLimit(1)
@@ -300,7 +306,7 @@ private struct EventChip: View {
         }
         .padding(.trailing, 5)
         .frame(height: 20)
-        .background(event.color.background)
+        .background(event.tag.background)
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 }
@@ -457,7 +463,7 @@ private struct WeekEventBlock: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Capsule().fill(event.color.tint).frame(width: 3)
+            Capsule().fill(event.tag.tint).frame(width: 3)
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.title)
                     .font(.system(size: 9, weight: .bold))
@@ -471,7 +477,7 @@ private struct WeekEventBlock: View {
         }
         .padding(5)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(event.color.background)
+        .background(event.tag.background)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
@@ -480,6 +486,7 @@ private struct DayAgendaPanel: View {
     @EnvironmentObject private var store: DashboardStore
     let selectedDate: Date
     let addAction: () -> Void
+    let editAction: (CalendarEvent) -> Void
     private let calendar = Calendar.current
 
     private var events: [CalendarEvent] {
@@ -521,7 +528,7 @@ private struct DayAgendaPanel: View {
                         .padding(.vertical, 28)
                     } else {
                         ForEach(events) { event in
-                            AgendaEventCard(event: event)
+                            AgendaEventCard(event: event, editAction: { editAction(event) })
                         }
                     }
 
@@ -532,7 +539,7 @@ private struct DayAgendaPanel: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         ForEach(upcoming) { event in
                             HStack(alignment: .top, spacing: 10) {
-                                Circle().fill(event.color.tint).frame(width: 8, height: 8).padding(.top, 4)
+                                Circle().fill(event.tag.tint).frame(width: 8, height: 8).padding(.top, 4)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(event.title).font(.system(size: 12, weight: .semibold))
                                     Text(event.startAt.formatted(.dateTime.weekday(.abbreviated).hour().minute()))
@@ -574,21 +581,35 @@ private struct DayAgendaPanel: View {
 private struct AgendaEventCard: View {
     @EnvironmentObject private var store: DashboardStore
     let event: CalendarEvent
+    let editAction: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
-            Capsule().fill(event.color.tint).frame(width: 5)
+            Capsule().fill(event.tag.tint).frame(width: 5)
             VStack(alignment: .leading, spacing: 5) {
                 Text("\(event.startAt.formatted(date: .omitted, time: .shortened)) – \(event.endAt.formatted(date: .omitted, time: .shortened))")
                     .font(.system(size: 10))
                     .foregroundStyle(Palette.muted)
                 Text(event.title).font(.system(size: 14, weight: .bold)).lineLimit(1)
+                Text(event.tag.displayName)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(event.tag.tint)
+                    .padding(.horizontal, 7)
+                    .frame(height: 18)
+                    .background(event.tag.background)
+                    .clipShape(Capsule())
                 if !event.notes.isEmpty {
                     Text(event.notes).font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(1)
                 }
             }
             .padding(14)
             Spacer(minLength: 4)
+            Button(action: editAction) {
+                Image(systemName: "pencil").font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Palette.muted)
+            .help("Edit event")
             Button { store.deleteCalendarEvent(event.id) } label: {
                 Image(systemName: "trash").font(.system(size: 10))
             }
@@ -604,27 +625,31 @@ private struct AgendaEventCard: View {
     }
 }
 
-private struct AddCalendarEventSheet: View {
+private struct CalendarEventSheet: View {
     @EnvironmentObject private var store: DashboardStore
-    @Binding var isPresented: Bool
-    @State private var title = ""
+    @Environment(\.dismiss) private var dismiss
+    private let event: CalendarEvent?
+    @State private var title: String
     @State private var startAt: Date
     @State private var endAt: Date
-    @State private var notes = ""
-    @State private var color: CalendarEventColor = .green
+    @State private var notes: String
+    @State private var tag: CalendarEventTag
     @FocusState private var titleFocused: Bool
 
-    init(date: Date, isPresented: Binding<Bool>) {
-        _isPresented = isPresented
+    init(date: Date, event: CalendarEvent? = nil) {
+        self.event = event
         let calendar = Calendar.current
         let start = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: date) ?? date
-        _startAt = State(initialValue: start)
-        _endAt = State(initialValue: start.addingTimeInterval(60 * 60))
+        _title = State(initialValue: event?.title ?? "")
+        _startAt = State(initialValue: event?.startAt ?? start)
+        _endAt = State(initialValue: event?.endAt ?? start.addingTimeInterval(60 * 60))
+        _notes = State(initialValue: event?.notes ?? "")
+        _tag = State(initialValue: event?.tag ?? .school)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("New event").font(.system(size: 22, weight: .bold))
+            Text(event == nil ? "New event" : "Edit event").font(.system(size: 22, weight: .bold))
             TextField("Event name", text: $title)
                 .textFieldStyle(.roundedBorder)
                 .focused($titleFocused)
@@ -632,24 +657,18 @@ private struct AddCalendarEventSheet: View {
             eventDateRow("Ends", selection: $endAt, range: startAt...)
             TextField("Notes (optional)", text: $notes)
                 .textFieldStyle(.roundedBorder)
-            Picker("Color", selection: $color) {
-                ForEach(CalendarEventColor.allCases) { color in
-                    Text(color.displayName).tag(color)
+            Picker("Tag", selection: $tag) {
+                ForEach(CalendarEventTag.allCases) { tag in
+                    Text(tag.displayName).tag(tag)
                 }
             }
 
             HStack {
                 Spacer()
-                Button("Cancel") { isPresented = false }
-                Button("Add Event") {
-                    store.addCalendarEvent(
-                        title: title,
-                        startAt: startAt,
-                        endAt: endAt,
-                        notes: notes,
-                        color: color
-                    )
-                    isPresented = false
+                Button("Cancel") { dismiss() }
+                Button(event == nil ? "Add Event" : "Save Changes") {
+                    save()
+                    dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -660,6 +679,27 @@ private struct AddCalendarEventSheet: View {
         .onAppear { titleFocused = true }
         .onChange(of: startAt) { _, newStart in
             if endAt <= newStart { endAt = newStart.addingTimeInterval(60 * 60) }
+        }
+    }
+
+    private func save() {
+        if let event {
+            store.updateCalendarEvent(
+                event.id,
+                title: title,
+                startAt: startAt,
+                endAt: endAt,
+                notes: notes,
+                tag: tag
+            )
+        } else {
+            store.addCalendarEvent(
+                title: title,
+                startAt: startAt,
+                endAt: endAt,
+                notes: notes,
+                tag: tag
+            )
         }
     }
 
@@ -697,12 +737,14 @@ private struct AddCalendarEventSheet: View {
     }
 }
 
-private extension CalendarEventColor {
+private extension CalendarEventTag {
     var tint: Color {
         switch self {
-        case .green: Palette.focus
-        case .purple: Color(red: 0.53, green: 0.39, blue: 0.62)
-        case .tan: Color(red: 0.62, green: 0.51, blue: 0.34)
+        case .school: Palette.focus
+        case .college: Color(red: 0.53, green: 0.39, blue: 0.62)
+        case .extracurriculars: Color(red: 0.25, green: 0.48, blue: 0.64)
+        case .fun: Color(red: 0.76, green: 0.38, blue: 0.34)
+        case .misc: Color(red: 0.62, green: 0.51, blue: 0.34)
         }
     }
 
