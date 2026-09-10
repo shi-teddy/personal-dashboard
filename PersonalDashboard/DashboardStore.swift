@@ -50,7 +50,7 @@ final class DashboardStore: ObservableObject {
         classificationSubgroups = load([ClassificationSubgroup].self, key: classificationSubgroupsKey)
             ?? Self.defaultClassificationSubgroups
         classificationRules = load([ActivityClassificationRule].self, key: classificationRulesKey) ?? []
-        removeExpiredTodos()
+        removeCompletedTodosDueForNightlyClear()
         normalizeTodoOrder()
         let activeTodoCount = todos.filter { !$0.isCompleted }.count
         if defaults.object(forKey: todoDividerKey) != nil {
@@ -76,12 +76,16 @@ final class DashboardStore: ObservableObject {
 
     func toggleTodo(_ id: UUID) {
         guard let index = todos.firstIndex(where: { $0.id == id }) else { return }
+        let dividerIndexBeforeToggle = todoDividerIndex
         let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
         let dividerWasAtBottom = todoDividerIndex >= activeTodoCount
         var item = todos.remove(at: index)
         item.completedAt = item.completedAt == nil ? Date() : nil
         if item.isCompleted {
             todos.append(item)
+            if index < dividerIndexBeforeToggle {
+                todoDividerIndex = max(0, dividerIndexBeforeToggle - 1)
+            }
         } else {
             let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
             let insertionIndex = min(todoDividerIndex, firstCompleted)
@@ -107,12 +111,26 @@ final class DashboardStore: ObservableObject {
         todos.insert(item, at: targetIndex)
     }
 
-    func moveTodo(_ id: UUID, toIndex destinationIndex: Int) {
+    func moveTodo(_ id: UUID, toIndex destinationIndex: Int, crossedDivider: Bool = false) {
         guard let sourceIndex = todos.firstIndex(where: { $0.id == id }) else { return }
+        let dividerIndexBeforeMove = todoDividerIndex
         let item = todos.remove(at: sourceIndex)
         let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
         let allowedRange = item.isCompleted ? firstCompleted...todos.count : 0...firstCompleted
-        todos.insert(item, at: destinationIndex.clamped(to: allowedRange))
+        let insertionIndex = destinationIndex.clamped(to: allowedRange)
+        todos.insert(item, at: insertionIndex)
+
+        if !item.isCompleted {
+            if sourceIndex >= dividerIndexBeforeMove,
+               insertionIndex < dividerIndexBeforeMove || crossedDivider {
+                todoDividerIndex = dividerIndexBeforeMove + 1
+            } else if sourceIndex < dividerIndexBeforeMove,
+                      insertionIndex >= dividerIndexBeforeMove || crossedDivider {
+                todoDividerIndex = max(0, dividerIndexBeforeMove - 1)
+            } else {
+                todoDividerIndex = dividerIndexBeforeMove
+            }
+        }
     }
 
     func setTodoDividerIndex(_ index: Int) {
@@ -120,11 +138,16 @@ final class DashboardStore: ObservableObject {
         todoDividerIndex = index.clamped(to: 0...activeTodoCount)
     }
 
-    func removeExpiredTodos(now: Date = Date()) {
-        let expiration = now.addingTimeInterval(-24 * 60 * 60)
+    func removeCompletedTodosDueForNightlyClear(now: Date = Date()) {
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: now)
+        let todayAtFour = calendar.date(byAdding: .hour, value: 4, to: startOfToday) ?? startOfToday
+        let latestFourAM = now >= todayAtFour
+            ? todayAtFour
+            : (calendar.date(byAdding: .day, value: -1, to: todayAtFour) ?? todayAtFour)
         let remainingTodos = todos.filter { item in
             guard let completedAt = item.completedAt else { return true }
-            return completedAt > expiration
+            return completedAt > latestFourAM
         }
         if remainingTodos != todos {
             todos = remainingTodos
@@ -133,21 +156,23 @@ final class DashboardStore: ObservableObject {
         }
     }
 
-    /// Schedule the next removal for the exact 24-hour deadline. The view-level
-    /// minute timer remains a fallback, but expiration no longer depends on the
-    /// dashboard being visible or SwiftUI keeping that timer alive.
+    /// Schedule one shared nightly cleanup at 4:00 AM. The view-level minute
+    /// timer remains a fallback, and launch-time cleanup catches missed runs.
     private func scheduleTodoCleanup(now: Date = Date()) {
         todoCleanupTimer?.invalidate()
         todoCleanupTimer = nil
 
-        guard let nextExpiration = todos.compactMap({ item in
-            item.completedAt?.addingTimeInterval(24 * 60 * 60)
-        }).min() else { return }
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: now)
+        let todayAtFour = calendar.date(byAdding: .hour, value: 4, to: startOfToday) ?? startOfToday
+        let nextFourAM = now < todayAtFour
+            ? todayAtFour
+            : (calendar.date(byAdding: .day, value: 1, to: todayAtFour) ?? now.addingTimeInterval(24 * 60 * 60))
 
-        let timer = Timer(timeInterval: max(0.05, nextExpiration.timeIntervalSince(now)), repeats: false) {
+        let timer = Timer(timeInterval: max(0.05, nextFourAM.timeIntervalSince(now)), repeats: false) {
             [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.removeExpiredTodos()
+                self?.removeCompletedTodosDueForNightlyClear()
             }
         }
         RunLoop.main.add(timer, forMode: .common)

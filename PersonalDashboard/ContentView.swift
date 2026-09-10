@@ -48,8 +48,8 @@ struct ContentView: View {
         }
         .background(Palette.canvas)
         .preferredColorScheme(.light)
-        .onAppear { store.removeExpiredTodos() }
-        .onReceive(cleanupTimer) { store.removeExpiredTodos(now: $0) }
+        .onAppear { store.removeCompletedTodosDueForNightlyClear() }
+        .onReceive(cleanupTimer) { store.removeCompletedTodosDueForNightlyClear(now: $0) }
     }
 }
 
@@ -1120,7 +1120,7 @@ private struct TodoCard: View {
             Divider().overlay(Palette.border)
             Text("\(completedCount) of \(store.todos.count) complete")
                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
-            Text("Completed items clear automatically after 24 hours.")
+            Text("Completed items clear automatically at 4:00 AM.")
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
         }
         .padding(20).background(Palette.panel)
@@ -1156,12 +1156,8 @@ private struct TodoCard: View {
     private var todoDivider: some View {
         HStack(spacing: 8) {
             Rectangle().fill(Palette.border).frame(height: 1)
-            HStack(spacing: 5) {
-                Text("DO TODAY")
-                Image(systemName: "line.3.horizontal")
-                Text("BACKLOG")
-            }
-            .font(.system(size: 8, weight: .bold))
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(Palette.muted)
             Rectangle().fill(Palette.border).frame(height: 1)
         }
@@ -1205,11 +1201,34 @@ private struct TodoCard: View {
                     todoDragOffset = 0
                     return
                 }
-                let rowStride: CGFloat = 30
-                let rowDelta = Int((value.translation.height / rowStride).rounded())
+                let rowStride: CGFloat = 34
+                let dividerGap: CGFloat = 44
+                let dividerIndex = store.todoDividerIndex
+                let startsInBacklog = sourceIndex >= dividerIndex
+                let isMovingTowardDivider = startsInBacklog
+                    ? value.translation.height < 0
+                    : value.translation.height > 0
+                let rowsBeforeDivider = startsInBacklog
+                    ? max(0, sourceIndex - dividerIndex)
+                    : max(0, dividerIndex - 1 - sourceIndex)
+                let sameSideDistance = CGFloat(rowsBeforeDivider) * rowStride
+                let dragMagnitude = abs(value.translation.height)
+                let crossedDivider = isMovingTowardDivider
+                    && dragMagnitude >= sameSideDistance + dividerGap
+                let logicalTranslation: CGFloat
+                if isMovingTowardDivider {
+                    let logicalMagnitude = min(dragMagnitude, sameSideDistance)
+                        + max(0, dragMagnitude - sameSideDistance - dividerGap)
+                    logicalTranslation = value.translation.height < 0
+                        ? -logicalMagnitude
+                        : logicalMagnitude
+                } else {
+                    logicalTranslation = value.translation.height
+                }
+                let rowDelta = Int((logicalTranslation / rowStride).rounded())
                 let destination = min(max(sourceIndex + rowDelta, 0), store.todos.count - 1)
                 withAnimation(.easeInOut(duration: 0.16)) {
-                    store.moveTodo(id, toIndex: destination)
+                    store.moveTodo(id, toIndex: destination, crossedDivider: crossedDivider)
                     draggedTodoID = nil
                     todoDragOffset = 0
                 }
