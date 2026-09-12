@@ -2,3 +2,12 @@ xcuserdata/
 DerivedData/
 .DS_Store
 *.xcuserstate
+__pycache__/
+*.pyc
+
+# Keep the approved animation reference; builds and review renders are local.
+/output/*
+!/output/workcat-v3/
+/output/workcat-v3/*
+!/output/workcat-v3/workcat_final.gif
+!/output/workcat-v3/workcat_final.mp4

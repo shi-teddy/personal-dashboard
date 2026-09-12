@@ -17,6 +17,7 @@
 		A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A20000000000000000000012; };
 		A10000000000000000000013 = {isa = PBXBuildFile; fileRef = A20000000000000000000013; };
 		A10000000000000000000014 = {isa = PBXBuildFile; fileRef = A20000000000000000000014; };
+		A10000000000000000000015 = {isa = PBXBuildFile; fileRef = A20000000000000000000015; };
 /* End PBXBuildFile section */
 /* Begin PBXFileReference section */
 		A20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalDashboardApp.swift; sourceTree = "<group>"; };
@@ -33,6 +34,7 @@
 		A20000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCatView.swift; sourceTree = "<group>"; };
 		A20000000000000000000005 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PersonalDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FocusCatArtwork.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = text.json; path = Resources/ApprovedCatAnimation.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 /* Begin PBXFrameworksBuildPhase section */
 		A30000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
@@ -45,7 +47,7 @@
 		};
 		A40000000000000000000002 = {
 			isa = PBXGroup;
-			children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000006, A20000000000000000000007, A20000000000000000000008, A20000000000000000000009, A20000000000000000000010, A20000000000000000000011, A20000000000000000000012, A20000000000000000000013, A20000000000000000000014);
+			children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000006, A20000000000000000000007, A20000000000000000000008, A20000000000000000000009, A20000000000000000000010, A20000000000000000000011, A20000000000000000000012, A20000000000000000000013, A20000000000000000000014, A20000000000000000000015);
 			path = PersonalDashboard;
 			sourceTree = "<group>";
 		};
@@ -86,7 +88,7 @@
 		};
 /* End PBXProject section */
 /* Begin PBXResourcesBuildPhase section */
-		A70000000000000000000001 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		A70000000000000000000001 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000015); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXResourcesBuildPhase section */
 /* Begin PBXSourcesBuildPhase section */
 		A60000000000000000000001 = {

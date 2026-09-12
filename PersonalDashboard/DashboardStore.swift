@@ -37,12 +37,20 @@ final class DashboardStore: ObservableObject {
     private let classificationSubgroupsKey = "personal-dashboard.classification-subgroups.v1"
     private let classificationRulesKey = "personal-dashboard.classification-rules.v1"
     private let defaults: UserDefaults
+    private let nowProvider: () -> Date
+    private let automaticallySchedulesTodoCleanup: Bool
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var todoCleanupTimer: Timer?
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        nowProvider: @escaping () -> Date = Date.init,
+        automaticallySchedulesTodoCleanup: Bool = true
+    ) {
         self.defaults = defaults
+        self.nowProvider = nowProvider
+        self.automaticallySchedulesTodoCleanup = automaticallySchedulesTodoCleanup
         todos = load([TodoItem].self, key: todoKey) ?? Self.sampleTodos
         goals = load([GoalItem].self, key: goalKey) ?? Self.sampleGoals
         calendarEvents = load([CalendarEvent].self, key: calendarKey) ?? []
@@ -50,15 +58,17 @@ final class DashboardStore: ObservableObject {
         classificationSubgroups = load([ClassificationSubgroup].self, key: classificationSubgroupsKey)
             ?? Self.defaultClassificationSubgroups
         classificationRules = load([ActivityClassificationRule].self, key: classificationRulesKey) ?? []
-        removeCompletedTodosDueForNightlyClear()
+        let savedTodoDividerIndex = defaults.object(forKey: todoDividerKey).map { _ in
+            defaults.integer(forKey: todoDividerKey)
+        }
         normalizeTodoOrder()
         let activeTodoCount = todos.filter { !$0.isCompleted }.count
-        if defaults.object(forKey: todoDividerKey) != nil {
-            todoDividerIndex = defaults.integer(forKey: todoDividerKey)
-                .clamped(to: 0...activeTodoCount)
+        if let savedTodoDividerIndex {
+            todoDividerIndex = savedTodoDividerIndex.clamped(to: 0...activeTodoCount)
         } else {
             todoDividerIndex = activeTodoCount
         }
+        removeExpiredCompletedTodos()
         scheduleTodoCleanup()
     }
 
@@ -68,9 +78,8 @@ final class DashboardStore: ObservableObject {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
-        let dividerWasAtBottom = todoDividerIndex >= activeTodoCount
-        let insertionIndex = min(todoDividerIndex, activeTodoCount)
-        todos.insert(TodoItem(title: cleaned), at: insertionIndex)
+        let dividerWasAtBottom = todoDividerIndex == activeTodoCount
+        todos.insert(TodoItem(title: cleaned, createdAt: nowProvider()), at: activeTodoCount)
         if dividerWasAtBottom { todoDividerIndex = activeTodoCount + 1 }
     }
 
@@ -80,7 +89,7 @@ final class DashboardStore: ObservableObject {
         let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
         let dividerWasAtBottom = todoDividerIndex >= activeTodoCount
         var item = todos.remove(at: index)
-        item.completedAt = item.completedAt == nil ? Date() : nil
+        item.completedAt = item.completedAt == nil ? nowProvider() : nil
         if item.isCompleted {
             todos.append(item)
             if index < dividerIndexBeforeToggle {
@@ -88,27 +97,39 @@ final class DashboardStore: ObservableObject {
             }
         } else {
             let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
-            let insertionIndex = min(todoDividerIndex, firstCompleted)
-            todos.insert(item, at: insertionIndex)
+            todos.insert(item, at: firstCompleted)
             if dividerWasAtBottom { todoDividerIndex = firstCompleted + 1 }
         }
     }
 
     func deleteTodo(_ id: UUID) {
-        todos.removeAll { $0.id == id }
+        guard let index = todos.firstIndex(where: { $0.id == id }) else { return }
+        let dividerIndexBeforeDelete = todoDividerIndex
+        let removedUncheckedItemAboveDivider = !todos[index].isCompleted && index < todoDividerIndex
+        todos.remove(at: index)
+        if removedUncheckedItemAboveDivider {
+            todoDividerIndex = max(0, dividerIndexBeforeDelete - 1)
+        }
     }
 
     func moveTodo(_ id: UUID, before targetID: UUID) {
         guard id != targetID,
               let sourceIndex = todos.firstIndex(where: { $0.id == id }),
-              let originalTarget = todos.first(where: { $0.id == targetID }),
-              todos[sourceIndex].isCompleted == originalTarget.isCompleted else { return }
+              let originalTargetIndex = todos.firstIndex(where: { $0.id == targetID }),
+              todos[sourceIndex].isCompleted == todos[originalTargetIndex].isCompleted else { return }
+        let dividerIndexBeforeMove = todoDividerIndex
         let item = todos.remove(at: sourceIndex)
-        guard let targetIndex = todos.firstIndex(where: { $0.id == targetID }) else {
-            todos.append(item)
-            return
-        }
+        guard let targetIndex = todos.firstIndex(where: { $0.id == targetID }) else { return }
         todos.insert(item, at: targetIndex)
+
+        guard !item.isCompleted else { return }
+        if sourceIndex >= dividerIndexBeforeMove, originalTargetIndex < dividerIndexBeforeMove {
+            todoDividerIndex = dividerIndexBeforeMove + 1
+        } else if sourceIndex < dividerIndexBeforeMove, originalTargetIndex >= dividerIndexBeforeMove {
+            todoDividerIndex = max(0, dividerIndexBeforeMove - 1)
+        } else {
+            todoDividerIndex = dividerIndexBeforeMove
+        }
     }
 
     func moveTodo(_ id: UUID, toIndex destinationIndex: Int, crossedDivider: Bool = false) {
@@ -138,16 +159,12 @@ final class DashboardStore: ObservableObject {
         todoDividerIndex = index.clamped(to: 0...activeTodoCount)
     }
 
-    func removeCompletedTodosDueForNightlyClear(now: Date = Date()) {
-        let calendar = Calendar.current
-        let startOfToday = calendar.startOfDay(for: now)
-        let todayAtFour = calendar.date(byAdding: .hour, value: 4, to: startOfToday) ?? startOfToday
-        let latestFourAM = now >= todayAtFour
-            ? todayAtFour
-            : (calendar.date(byAdding: .day, value: -1, to: todayAtFour) ?? todayAtFour)
+    func removeExpiredCompletedTodos(now: Date? = nil) {
+        let now = now ?? nowProvider()
+        let expirationCutoff = now.addingTimeInterval(-24 * 60 * 60)
         let remainingTodos = todos.filter { item in
             guard let completedAt = item.completedAt else { return true }
-            return completedAt > latestFourAM
+            return completedAt > expirationCutoff
         }
         if remainingTodos != todos {
             todos = remainingTodos
@@ -156,23 +173,22 @@ final class DashboardStore: ObservableObject {
         }
     }
 
-    /// Schedule one shared nightly cleanup at 4:00 AM. The view-level minute
-    /// timer remains a fallback, and launch-time cleanup catches missed runs.
-    private func scheduleTodoCleanup(now: Date = Date()) {
+    /// Schedule cleanup for the first completed todo that reaches 24 hours.
+    /// The view-level minute timer remains a fallback, and launch-time cleanup
+    /// catches expirations missed while the app was closed.
+    private func scheduleTodoCleanup(now: Date? = nil) {
         todoCleanupTimer?.invalidate()
         todoCleanupTimer = nil
+        guard automaticallySchedulesTodoCleanup else { return }
 
-        let calendar = Calendar.current
-        let startOfToday = calendar.startOfDay(for: now)
-        let todayAtFour = calendar.date(byAdding: .hour, value: 4, to: startOfToday) ?? startOfToday
-        let nextFourAM = now < todayAtFour
-            ? todayAtFour
-            : (calendar.date(byAdding: .day, value: 1, to: todayAtFour) ?? now.addingTimeInterval(24 * 60 * 60))
+        let now = now ?? nowProvider()
+        guard let nextExpiration = todos.compactMap(\.completedAt).min()?
+            .addingTimeInterval(24 * 60 * 60) else { return }
 
-        let timer = Timer(timeInterval: max(0.05, nextFourAM.timeIntervalSince(now)), repeats: false) {
+        let timer = Timer(timeInterval: max(0.05, nextExpiration.timeIntervalSince(now)), repeats: false) {
             [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.removeCompletedTodosDueForNightlyClear()
+                self?.removeExpiredCompletedTodos()
             }
         }
         RunLoop.main.add(timer, forMode: .common)

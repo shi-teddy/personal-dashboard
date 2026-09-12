@@ -48,8 +48,8 @@ struct ContentView: View {
         }
         .background(Palette.canvas)
         .preferredColorScheme(.light)
-        .onAppear { store.removeCompletedTodosDueForNightlyClear() }
-        .onReceive(cleanupTimer) { store.removeCompletedTodosDueForNightlyClear(now: $0) }
+        .onAppear { store.removeExpiredCompletedTodos() }
+        .onReceive(cleanupTimer) { store.removeExpiredCompletedTodos(now: $0) }
     }
 }
 
@@ -109,8 +109,8 @@ private struct HomeDashboard: View {
                 Group {
                     if selectedMode == .calendar { CalendarPanel() } else { AnalyticsPanel() }
                 }
-                .padding(.horizontal, selectedMode == .calendar ? 10 : 26)
-                .padding(.bottom, selectedMode == .calendar ? 8 : 22)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Palette.panel)
@@ -205,9 +205,14 @@ private struct AnalyticsPanel: View {
         VStack(spacing: 12) {
             TrackedTimeCard(displayedDate: $displayedDate).frame(maxHeight: .infinity)
             FocusDriftCard(displayedDate: displayedDate).frame(height: 152)
-            HStack(spacing: 26) {
-                ProductivityCard(displayedDate: displayedDate)
-                TopActivityCard(displayedDate: displayedDate)
+            GeometryReader { proxy in
+                let cardWidth = max(0, (proxy.size.width - 26) / 2)
+                HStack(spacing: 26) {
+                    ProductivityCard(displayedDate: displayedDate)
+                        .frame(width: cardWidth)
+                    TopActivityCard(displayedDate: displayedDate)
+                        .frame(width: cardWidth)
+                }
             }
             .frame(height: 166)
         }
@@ -343,10 +348,14 @@ private struct ActivityChart: View {
 
                     ZStack(alignment: .topLeading) {
                         let columnWidth = plotWidth / 24
-                        ForEach(0...24, id: \.self) { column in
-                            Rectangle().fill(Palette.grid).frame(width: 1, height: plotHeight)
-                                .offset(x: plotWidth * CGFloat(column) / 24)
+                        Path { path in
+                            for column in 0...24 {
+                                let x = plotWidth * CGFloat(column) / 24
+                                path.move(to: CGPoint(x: x, y: 0))
+                                path.addLine(to: CGPoint(x: x, y: plotHeight))
+                            }
                         }
+                        .stroke(Palette.grid, lineWidth: 1)
                         ForEach(0..<5, id: \.self) { row in
                             Rectangle().fill(Palette.grid).frame(width: plotWidth, height: 1)
                                 .offset(y: plotHeight * CGFloat(row) / 4)
@@ -355,10 +364,12 @@ private struct ActivityChart: View {
                             ForEach(segments.filter { $0.hourIndex == index }) { segment in
                                 let startY = plotHeight * CGFloat(segment.startMinute / 60)
                                 let segmentHeight = plotHeight * CGFloat((segment.endMinute - segment.startMinute) / 60)
+                                let barWidth = max(1, columnWidth - 3)
+                                let centeredX = CGFloat(index) * columnWidth + (columnWidth - barWidth) / 2
                                 RoundedRectangle(cornerRadius: 2)
                                     .fill(segment.classification.dashboardColor)
-                                    .frame(width: max(1, columnWidth - 3), height: segmentHeight)
-                                    .offset(x: CGFloat(index) * columnWidth + 1.5, y: startY)
+                                    .frame(width: barWidth, height: segmentHeight)
+                                    .offset(x: centeredX, y: startY)
                                     .help(segmentHelp(segment, hour: hours[index]))
                             }
                         }
@@ -424,6 +435,10 @@ private struct FocusDriftCard: View {
                             .font(.system(size: 10))
                             .foregroundStyle(Palette.muted)
                     } else {
+                        scoreAreaPath(points: points, size: proxy.size, keyPath: \.focusScore)
+                            .fill(Palette.focus.opacity(0.12))
+                        scoreAreaPath(points: points, size: proxy.size, keyPath: \.driftScore)
+                            .fill(Palette.warning.opacity(0.10))
                         scorePath(points: points, size: proxy.size, keyPath: \.focusScore)
                             .stroke(Palette.focus, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
                         scorePath(points: points, size: proxy.size, keyPath: \.driftScore)
@@ -442,15 +457,56 @@ private struct FocusDriftCard: View {
         size: CGSize,
         keyPath: KeyPath<FocusDriftPoint, Double>
     ) -> Path {
+        let chartPoints = points.map { chartPoint(for: $0, size: size, keyPath: keyPath) }
         var path = Path()
-        for (index, point) in points.enumerated() {
-            let x = size.width * CGFloat(point.windowIndex) / 48
-            let score = min(30, max(0, point[keyPath: keyPath]))
-            let y = size.height * (1 - CGFloat(score / 30))
-            if index == 0 { path.move(to: CGPoint(x: x, y: y)) }
-            else { path.addLine(to: CGPoint(x: x, y: y)) }
+        guard let first = chartPoints.first else { return path }
+        path.move(to: first)
+        guard chartPoints.count > 1 else { return path }
+
+        for index in 0..<(chartPoints.count - 1) {
+            let previous = chartPoints[max(0, index - 1)]
+            let current = chartPoints[index]
+            let next = chartPoints[index + 1]
+            let following = chartPoints[min(chartPoints.count - 1, index + 2)]
+            let lowerY = min(current.y, next.y)
+            let upperY = max(current.y, next.y)
+            let control1 = CGPoint(
+                x: current.x + (next.x - previous.x) / 6,
+                y: min(upperY, max(lowerY, current.y + (next.y - previous.y) / 6))
+            )
+            let control2 = CGPoint(
+                x: next.x - (following.x - current.x) / 6,
+                y: min(upperY, max(lowerY, next.y - (following.y - current.y) / 6))
+            )
+            path.addCurve(to: next, control1: control1, control2: control2)
         }
         return path
+    }
+
+    private func scoreAreaPath(
+        points: [FocusDriftPoint],
+        size: CGSize,
+        keyPath: KeyPath<FocusDriftPoint, Double>
+    ) -> Path {
+        guard let first = points.first, let last = points.last else { return Path() }
+        var area = scorePath(points: points, size: size, keyPath: keyPath)
+        let firstPoint = chartPoint(for: first, size: size, keyPath: keyPath)
+        let lastPoint = chartPoint(for: last, size: size, keyPath: keyPath)
+        area.addLine(to: CGPoint(x: lastPoint.x, y: size.height))
+        area.addLine(to: CGPoint(x: firstPoint.x, y: size.height))
+        area.closeSubpath()
+        return area
+    }
+
+    private func chartPoint(
+        for point: FocusDriftPoint,
+        size: CGSize,
+        keyPath: KeyPath<FocusDriftPoint, Double>
+    ) -> CGPoint {
+        let x = size.width * CGFloat(point.windowIndex) / 48
+        let score = min(30, max(0, point[keyPath: keyPath]))
+        let y = size.height * (1 - CGFloat(score / 30))
+        return CGPoint(x: x, y: y)
     }
 }
 
@@ -489,7 +545,7 @@ private struct ProductivityCard: View {
             }
             .frame(maxWidth: 108, alignment: .leading)
         }
-        .padding(16).frame(maxWidth: .infinity).background(Palette.surface)
+        .padding(16).frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
     }
@@ -588,7 +644,7 @@ private struct TopActivityCard: View {
                 }
             }
         }
-        .padding(14).frame(maxWidth: .infinity).background(Palette.surface)
+        .padding(14).frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
     }
@@ -1068,15 +1124,23 @@ private struct GoalsCard: View {
 private struct GoalRow: View {
     @EnvironmentObject private var store: DashboardStore
     let goal: GoalItem
+    @State private var showingProgressEditor = false
+
     var body: some View {
         VStack(spacing: 8) {
-            HStack {
-                Text(goal.title).font(.system(size: 16, weight: .semibold)).lineLimit(1)
+            HStack(alignment: .top, spacing: 8) {
+                Text(goal.title)
+                    .font(.system(size: 16, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
                 Spacer()
-                TextField("%", value: Binding(get: { goal.progress }, set: { store.setGoalProgress(goal.id, progress: $0) }), format: .number)
-                    .textFieldStyle(.plain).multilineTextAlignment(.trailing)
-                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(Palette.focus).frame(width: 38)
-                Text("%").font(.system(size: 14, weight: .semibold)).foregroundStyle(Palette.focus)
+                Button { showingProgressEditor = true } label: {
+                    Text("\(goal.progress)%")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Palette.focus)
+                }
+                .buttonStyle(.plain)
+                .help("Edit progress")
                 Button { store.deleteGoal(goal.id) } label: { Image(systemName: "trash").font(.system(size: 11)) }
                     .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Delete goal")
             }
@@ -1087,6 +1151,52 @@ private struct GoalRow: View {
                 }
             }.frame(height: 10)
         }
+        .sheet(isPresented: $showingProgressEditor) {
+            EditGoalProgressSheet(goal: goal, isPresented: $showingProgressEditor)
+        }
+    }
+}
+
+private struct EditGoalProgressSheet: View {
+    @EnvironmentObject private var store: DashboardStore
+    let goal: GoalItem
+    @Binding var isPresented: Bool
+    @State private var progress: Double
+
+    init(goal: GoalItem, isPresented: Binding<Bool>) {
+        self.goal = goal
+        _isPresented = isPresented
+        _progress = State(initialValue: Double(goal.progress))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Edit progress")
+                .font(.system(size: 20, weight: .bold))
+            Text(goal.title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 14) {
+                Slider(value: $progress, in: 0...100, step: 1)
+                Text("\(Int(progress))%")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Palette.focus)
+                    .monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { isPresented = false }
+                Button("Save") {
+                    store.setGoalProgress(goal.id, progress: Int(progress))
+                    isPresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 340)
     }
 }
 
@@ -1120,7 +1230,7 @@ private struct TodoCard: View {
             Divider().overlay(Palette.border)
             Text("\(completedCount) of \(store.todos.count) complete")
                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
-            Text("Completed items clear automatically at 4:00 AM.")
+            Text("Completed items clear 24 hours after completion.")
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
         }
         .padding(20).background(Palette.panel)

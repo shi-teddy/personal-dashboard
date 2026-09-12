@@ -32,7 +32,9 @@ final class FocusCatController: ObservableObject {
     @Published private(set) var statusText = ""
     @Published private(set) var isEnabled: Bool
 
-    private struct ChromeTarget: Equatable {
+    struct ChromeTarget: Equatable {
+        let windowID: String
+        let tabID: String
         let bundleIdentifier: String
         let tabIndex: Int
         let url: String
@@ -56,28 +58,37 @@ final class FocusCatController: ObservableObject {
     private let enabledKey = "personal-dashboard.focus-cat-enabled.v1"
     private let panelSize = CatLayout.panelSize
     private let defaults: UserDefaults
+    private let browserMonitoringEnabled: Bool
+    private let clock: () -> Date
     private var panel: FocusCatPanel?
     private var movementTimer: Timer?
     private var detectionTimer: Timer?
     private var lastTick = Date()
     private var stalledTravelTime = 0.0
+    private var travelSpeed = 0.0
+    private var travelPhasePerPoint = 0.0
     private var destinationOrigin: CGPoint?
     private var pendingInterventionOrigin: CGPoint?
     private var intervention: Intervention?
     private var wakeEndsAt: Date?
     private var interventionStartedAt: Date?
     private var closeAttempted = false
+    private var lastTargetCheck = Date.distantPast
     private var celebrationEndsAt: Date?
-    // Presentation-only distinction; both trips retain their existing movement logic.
-    var isSprinting: Bool { pose == .running && !isReturningHome }
+    // Both directions use the gait in the approved GIF.
+    var isSprinting: Bool { false }
+    var isDeparting: Bool { !isReturningHome }
 
     private var isReturningHome = false
     private var lastHandledURL = ""
     private var lastHandledAt = Date.distantPast
     private var hasStarted = false
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, browserMonitoringEnabled: Bool = true,
+         clock: @escaping () -> Date = Date.init) {
         self.defaults = defaults
+        self.browserMonitoringEnabled = browserMonitoringEnabled
+        self.clock = clock
         if defaults.object(forKey: enabledKey) == nil {
             isEnabled = true
         } else {
@@ -118,7 +129,7 @@ final class FocusCatController: ObservableObject {
         panel?.orderFrontRegardless()
     }
 
-    /// Runs the full wake, sprint, paw, and return sequence without touching Chrome.
+    /// Runs the full approved wake, walk, paw, and return sequence without touching Chrome.
     func previewIntervention() {
         guard isEnabled, intervention == nil, !isReturningHome, let panel else { return }
         showPanel()
@@ -129,7 +140,7 @@ final class FocusCatController: ObservableObject {
         )
         intervention = .preview
         pendingInterventionOrigin = clampOrigin(previewPoint, to: currentScreen)
-        beginWake(now: Date())
+        beginWake(now: clock())
     }
 
     private func showPanel() {
@@ -163,13 +174,14 @@ final class FocusCatController: ObservableObject {
 
     private func startTimers() {
         guard movementTimer == nil else { return }
-        lastTick = Date()
+        lastTick = clock()
         let movementTimer = Timer(timeInterval: CatGait.updateInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.movementTick() }
         }
         RunLoop.main.add(movementTimer, forMode: .common)
         self.movementTimer = movementTimer
 
+        guard browserMonitoringEnabled else { return }
         let detectionTimer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.scanChrome() }
         }
@@ -185,10 +197,15 @@ final class FocusCatController: ObservableObject {
         detectionTimer = nil
     }
 
-    private func movementTick(now: Date = Date()) {
+    func movementTick(now suppliedTime: Date? = nil) {
+        let now = suppliedTime ?? clock()
         guard isEnabled, let panel else { return }
         let elapsed = min(0.1, max(0, now.timeIntervalSince(lastTick)))
         lastTick = now
+
+        if browserMonitoringEnabled, now.timeIntervalSince(lastTargetCheck) >= 0.35 {
+            checkInterventionTarget(now: now)
+        }
 
         switch pose {
         case .settling:
@@ -208,6 +225,7 @@ final class FocusCatController: ObservableObject {
                 pendingInterventionOrigin = nil
                 pose = .running
                 animationPhase = 0
+                prepareTravel()
                 if let intervention { statusText = "Running to \(intervention.label)" }
             }
             return
@@ -217,7 +235,7 @@ final class FocusCatController: ObservableObject {
             return
 
         case .celebrating:
-            animationPhase += elapsed * 7
+            animationPhase = min(CatLayout.recoverDuration, animationPhase + elapsed)
             if let celebrationEndsAt, now >= celebrationEndsAt {
                 beginReturnHome()
             }
@@ -232,10 +250,10 @@ final class FocusCatController: ObservableObject {
             let dy = destinationOrigin.y - panel.frame.origin.y
             let distance = hypot(dx, dy)
             let gait = isReturningHome ? CatGait.walk : CatGait.run
-            let speed = CGFloat(gait.speed)
+            let speed = CGFloat(travelSpeed > 0 ? travelSpeed : gait.speed)
             let step = speed * elapsed
 
-            if distance <= step || distance < 1 {
+            if distance <= step {
                 movePanel(to: destinationOrigin)
                 finishTravel(now: now)
             } else {
@@ -250,7 +268,7 @@ final class FocusCatController: ObservableObject {
                 // and any screen-edge clamping. A stationary cat cannot skate.
                 let travelled = hypot(panel.frame.origin.x - previousOrigin.x,
                                       panel.frame.origin.y - previousOrigin.y)
-                animationPhase += gait.phaseAdvance(distance: Double(travelled))
+                animationPhase += Double(travelled) * (travelPhasePerPoint > 0 ? travelPhasePerPoint : 1/gait.speed)
                 // A display/window constraint may make the final destination
                 // unreachable. Once stopped at that boundary, finish the
                 // approach instead of preventing the guarded close forever.
@@ -263,8 +281,21 @@ final class FocusCatController: ObservableObject {
         }
 
         if pose == .sleeping {
-            animationPhase += elapsed * 0.42
+            animationPhase += elapsed
         }
+    }
+
+    /// Fit an integral number of the approved walk cycles to the trip. This
+    /// finishes on the authored standing pose instead of snapping mid-stride.
+    private func prepareTravel() {
+        guard let panel, let destinationOrigin else { return }
+        let length = Double(distance(from: panel.frame.origin, to: destinationOrigin))
+        guard length > 0 else { travelSpeed = 0; travelPhasePerPoint = 0; return }
+        let gait = CatGait.walk
+        let cycles = max(1, (length / gait.distancePerLoop).rounded())
+        let duration = cycles * gait.loopDuration
+        travelSpeed = length / duration
+        travelPhasePerPoint = duration / length
     }
 
     private func finishTravel(now: Date) {
@@ -299,26 +330,27 @@ final class FocusCatController: ObservableObject {
 
     private func updateReach(now: Date) {
         guard let startedAt = interventionStartedAt else { return }
-        let progress = min(1, max(0, now.timeIntervalSince(startedAt) / 1.15))
-        animationPhase = progress
+        let elapsed = max(0, now.timeIntervalSince(startedAt))
+        animationPhase = min(CatLayout.reachDuration, elapsed)
 
-        if progress >= 0.62, !closeAttempted {
+        if elapsed >= CatLayout.closeTime, !closeAttempted {
             closeAttempted = true
-            let succeeded: Bool
             switch intervention {
             case .chrome(let target):
-                succeeded = closeChromeTab(target)
+                let succeeded = closeChromeTab(target)
                 statusText = succeeded ? "Closed \(target.label)" : "Tab changed — leaving it alone"
             case .preview:
-                succeeded = true
                 statusText = "Got it!"
             case .none:
-                succeeded = false
+                break
             }
-
-            // Return immediately after the guarded close attempt. A separate
-            // celebration pause should never strand the cat at the tab.
-            beginReturnHome()
+        }
+        // Match the GIF: finish the hold, then lower the same paw completely
+        // before moving away. Never switch directly from a raised paw to walking.
+        if elapsed >= CatLayout.reachDuration {
+            pose = .celebrating
+            animationPhase = 0
+            celebrationEndsAt = now.addingTimeInterval(CatLayout.recoverDuration)
         }
     }
 
@@ -337,6 +369,7 @@ final class FocusCatController: ObservableObject {
 
         let currentScreen = screen(containing: CGPoint(x: panel.frame.midX, y: panel.frame.midY))
         destinationOrigin = homeOrigin(in: currentScreen.visibleFrame)
+        prepareTravel()
         if let destinationOrigin, distance(from: panel.frame.origin, to: destinationOrigin) < 1 {
             self.destinationOrigin = nil
             finishReturnHome()
@@ -347,6 +380,7 @@ final class FocusCatController: ObservableObject {
         isReturningHome = false
         destinationOrigin = nil
         statusText = "Settling down"
+        facingRight = true
         pose = .settling
         animationPhase = 0
     }
@@ -359,6 +393,8 @@ final class FocusCatController: ObservableObject {
             destinationOrigin = home
             isReturningHome = true
             pose = .running
+            animationPhase = 0
+            prepareTravel()
         } else {
             panel.setFrameOrigin(home)
             resetToSleep()
@@ -367,6 +403,8 @@ final class FocusCatController: ObservableObject {
 
     private func resetToSleep() {
         stalledTravelTime = 0
+        travelSpeed = 0
+        travelPhasePerPoint = 0
         intervention = nil
         wakeEndsAt = nil
         interventionStartedAt = nil
@@ -389,7 +427,12 @@ final class FocusCatController: ObservableObject {
 
         lastHandledURL = target.url
         lastHandledAt = now
+        beginChromeIntervention(target, now: now)
+    }
+
+    func beginChromeIntervention(_ target: ChromeTarget, now: Date) {
         intervention = .chrome(target)
+        lastTargetCheck = now
         pendingInterventionOrigin = targetOrigin(for: target)
         showPanel()
         beginWake(now: now)
@@ -490,22 +533,17 @@ final class FocusCatController: ObservableObject {
     }
 
     private func homeOrigin(in visibleFrame: CGRect) -> CGPoint {
-        CGPoint(x: visibleFrame.minX + 12, y: visibleFrame.minY + 8)
+        CGPoint(x: visibleFrame.minX + 12,
+                y: visibleFrame.minY + 8 - CatLayout.visibleBounds.minY)
     }
 
     private func clampOrigin(_ origin: CGPoint, to screen: NSScreen) -> CGPoint {
-        CGPoint(
-            x: min(
-                max(origin.x, screen.visibleFrame.minX + 8),
-                screen.visibleFrame.maxX - panelSize.width - 8
-            ),
-            y: min(
-                max(origin.y, screen.visibleFrame.minY + 8),
-                // The overlay has transparent space above the lifted ears.
-                // Let that padding cross the screen edge so top-row tabs
-                // remain reachable instead of stopping below their close button.
-                screen.frame.maxY - panelSize.height + 12
-            )
+        let ink = CatLayout.visibleBounds
+        return CGPoint(
+            x: min(max(origin.x, screen.visibleFrame.minX + 8 - ink.minX),
+                   screen.visibleFrame.maxX - 8 - ink.maxX),
+            y: min(max(origin.y, screen.visibleFrame.minY + 8 - ink.minY),
+                   screen.frame.maxY - ink.maxY)
         )
     }
 
@@ -533,13 +571,16 @@ final class FocusCatController: ObservableObject {
         let script = """
         tell application id "\(bundleIdentifier)"
             if (count of windows) is 0 then return ""
+            set targetWindowID to id of front window
+            set targetTabID to id of active tab of front window
             set tabNumber to active tab index of front window
             set tabURL to URL of active tab of front window
             set tabTitle to title of active tab of front window
             set windowBounds to bounds of front window
             return (tabNumber as text) & "~~~" & tabURL & "~~~" & tabTitle & "~~~" & ¬
                 (item 1 of windowBounds as text) & "~~~" & (item 2 of windowBounds as text) & "~~~" & ¬
-                (item 3 of windowBounds as text) & "~~~" & (item 4 of windowBounds as text)
+                (item 3 of windowBounds as text) & "~~~" & (item 4 of windowBounds as text) & "~~~" & ¬
+                (targetWindowID as text) & "~~~" & (targetTabID as text)
         end tell
         """
 
@@ -557,7 +598,8 @@ final class FocusCatController: ObservableObject {
             statusText = ""
         }
         let parts = result.components(separatedBy: "~~~")
-        guard parts.count == 7,
+        guard parts.count == 9,
+              !parts[7].isEmpty, !parts[8].isEmpty,
               let tabIndex = Int(parts[0]),
               let left = Double(parts[3]),
               let top = Double(parts[4]),
@@ -566,6 +608,7 @@ final class FocusCatController: ObservableObject {
               let label = Self.distractionLabel(for: parts[1]) else { return nil }
 
         return ChromeTarget(
+            windowID: parts[7], tabID: parts[8],
             bundleIdentifier: bundleIdentifier,
             tabIndex: tabIndex,
             url: parts[1],
@@ -575,28 +618,106 @@ final class FocusCatController: ObservableObject {
         )
     }
 
-    private func closeChromeTab(_ target: ChromeTarget) -> Bool {
-        let escapedURL = target.url
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+    static func scriptLiteral(_ value: String) -> String {
+        "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    static func identityGuard(for target: ChromeTarget) -> String {
+        // Chrome's scripting dictionary declares these IDs as TEXT. Comparing
+        // them to integer literals incorrectly rejects the very same tab.
+        """
+        if (count of windows) is 0 then return "changed"
+        if ((id of front window) as text) is not \(scriptLiteral(target.windowID)) then return "changed"
+        if ((id of active tab of front window) as text) is not \(scriptLiteral(target.tabID)) then return "changed"
+        """
+    }
+
+    func checkInterventionTarget(now: Date,
+                                 execute: (String) -> String? = FocusCatController.executeChromeScript) {
+        lastTargetCheck = now
+        guard case .chrome(let target) = intervention, !closeAttempted,
+              pose == .waking || pose == .running || pose == .reaching else { return }
         let script = """
         tell application id "\(target.bundleIdentifier)"
-            if (count of windows) is 0 then return "missing"
-            if (active tab index of front window) is not \(target.tabIndex) then return "changed"
-            if (URL of active tab of front window) is not "\(escapedURL)" then return "changed"
-            close active tab of front window
+            \(Self.identityGuard(for: target))
+            return URL of active tab of front window
+        end tell
+        """
+        // A temporary Apple-event error is not evidence that the tab vanished.
+        guard let result = execute(script) else { return }
+        guard Self.distractionLabel(for: result) != target.label else { return }
+        cancelIntervention(now: now)
+    }
+
+    private func cancelIntervention(now: Date) {
+        if pose == .waking {
+            let settlePhase = max(0, CatLayout.settleDuration - animationPhase)
+            resetToSleep()
+            pose = .settling
+            animationPhase = settlePhase
+            statusText = "Tab gone — back to bed"
+        } else if pose == .reaching {
+            // Lower only as far as the paw has actually risen, then walk home.
+            let raised = min(1, max(0, (animationPhase - 0.25) / 0.65))
+            intervention = nil
+            closeAttempted = true
+            pose = .celebrating
+            animationPhase = 0.65 * (1 - raised)
+            celebrationEndsAt = now.addingTimeInterval(CatLayout.recoverDuration - animationPhase)
+            statusText = "Tab gone — back to bed"
+        } else {
+            beginReturnHome()
+        }
+    }
+
+    /// Resolve the original tab by identity, allowing navigation within the same
+    /// distraction. Revalidate atomically at close time; never close a replacement tab.
+    func closeChromeTab(_ target: ChromeTarget,
+                        execute: (String) -> String? = FocusCatController.executeChromeScript) -> Bool {
+        let identityGuard = Self.identityGuard(for: target)
+        // A page can navigate between the read and close Apple events. Retry a
+        // bounded number of times, always checking identity and classification.
+        for _ in 0..<3 {
+            let read = """
+            tell application id "\(target.bundleIdentifier)"
+                \(identityGuard)
+                return URL of active tab of front window
+            end tell
+            """
+            guard let currentURL = execute(read),
+                  Self.distractionLabel(for: currentURL) == target.label else { return false }
+            let close = Self.closeScript(for: target, expectedURL: currentURL)
+            let result = execute(close)
+            if result == "closed" { return true }
+            if result != "navigated" { return false }
+        }
+        return false
+    }
+
+    static func closeScript(for target: ChromeTarget, expectedURL: String) -> String {
+        """
+        tell application id "\(target.bundleIdentifier)"
+            \(identityGuard(for: target))
+            considering case
+                if (URL of active tab of front window) is not \(scriptLiteral(expectedURL)) then return "navigated"
+            end considering
+            close tab id \(scriptLiteral(target.tabID)) of window id \(scriptLiteral(target.windowID))
             return "closed"
         end tell
         """
+    }
+
+    nonisolated private static func executeChromeScript(_ source: String) -> String? {
         var error: NSDictionary?
-        let result = NSAppleScript(source: script)?.executeAndReturnError(&error).stringValue
-        return error == nil && result == "closed"
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
+        return error == nil ? result : nil
     }
 
     private static func distractionLabel(for urlString: String) -> String? {
         guard let url = URL(string: urlString), let host = url.host?.lowercased() else { return nil }
         if (host == "youtube.com" || host.hasSuffix(".youtube.com")),
-           url.path.lowercased().hasPrefix("/shorts") {
+           (url.path.lowercased() == "/shorts" || url.path.lowercased().hasPrefix("/shorts/")) {
             return "YouTube Shorts"
         }
         if host == "instagram.com" || host.hasSuffix(".instagram.com") {
