@@ -68,7 +68,7 @@ final class DashboardStore: ObservableObject {
         } else {
             todoDividerIndex = activeTodoCount
         }
-        removeExpiredCompletedTodos()
+        removeCompletedTodosAtDailyCutoff()
         scheduleTodoCleanup()
     }
 
@@ -159,12 +159,12 @@ final class DashboardStore: ObservableObject {
         todoDividerIndex = index.clamped(to: 0...activeTodoCount)
     }
 
-    func removeExpiredCompletedTodos(now: Date? = nil) {
+    func removeCompletedTodosAtDailyCutoff(now: Date? = nil) {
         let now = now ?? nowProvider()
-        let expirationCutoff = now.addingTimeInterval(-24 * 60 * 60)
+        let cleanupCutoff = mostRecentTodoCleanupCutoff(before: now)
         let remainingTodos = todos.filter { item in
             guard let completedAt = item.completedAt else { return true }
-            return completedAt > expirationCutoff
+            return completedAt >= cleanupCutoff
         }
         if remainingTodos != todos {
             todos = remainingTodos
@@ -173,26 +173,46 @@ final class DashboardStore: ObservableObject {
         }
     }
 
-    /// Schedule cleanup for the first completed todo that reaches 24 hours.
-    /// The view-level minute timer remains a fallback, and launch-time cleanup
-    /// catches expirations missed while the app was closed.
+    /// Schedule a local-time cleanup at the next 4:00 AM. The view-level minute
+    /// timer remains a fallback, and launch-time cleanup catches a cutoff missed
+    /// while the app was closed.
     private func scheduleTodoCleanup(now: Date? = nil) {
         todoCleanupTimer?.invalidate()
         todoCleanupTimer = nil
         guard automaticallySchedulesTodoCleanup else { return }
 
         let now = now ?? nowProvider()
-        guard let nextExpiration = todos.compactMap(\.completedAt).min()?
-            .addingTimeInterval(24 * 60 * 60) else { return }
+        guard todos.contains(where: \.isCompleted) else { return }
+        let nextCleanup = nextTodoCleanupDate(after: now)
 
-        let timer = Timer(timeInterval: max(0.05, nextExpiration.timeIntervalSince(now)), repeats: false) {
+        let timer = Timer(timeInterval: max(0.05, nextCleanup.timeIntervalSince(now)), repeats: false) {
             [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.removeExpiredCompletedTodos()
+                self?.removeCompletedTodosAtDailyCutoff()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         todoCleanupTimer = timer
+    }
+
+    private func mostRecentTodoCleanupCutoff(before now: Date) -> Date {
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: now)
+        let todayAtFour = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: startOfToday)
+            ?? startOfToday.addingTimeInterval(4 * 60 * 60)
+        guard now < todayAtFour else { return todayAtFour }
+        return calendar.date(byAdding: .day, value: -1, to: todayAtFour)
+            ?? todayAtFour.addingTimeInterval(-24 * 60 * 60)
+    }
+
+    private func nextTodoCleanupDate(after now: Date) -> Date {
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: now)
+        let todayAtFour = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: startOfToday)
+            ?? startOfToday.addingTimeInterval(4 * 60 * 60)
+        guard now >= todayAtFour else { return todayAtFour }
+        return calendar.date(byAdding: .day, value: 1, to: todayAtFour)
+            ?? todayAtFour.addingTimeInterval(24 * 60 * 60)
     }
 
     private func normalizeTodoOrder() {

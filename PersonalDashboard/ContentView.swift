@@ -48,8 +48,8 @@ struct ContentView: View {
         }
         .background(Palette.canvas)
         .preferredColorScheme(.light)
-        .onAppear { store.removeExpiredCompletedTodos() }
-        .onReceive(cleanupTimer) { store.removeExpiredCompletedTodos(now: $0) }
+        .onAppear { store.removeCompletedTodosAtDailyCutoff() }
+        .onReceive(cleanupTimer) { store.removeCompletedTodosAtDailyCutoff(now: $0) }
     }
 }
 
@@ -1230,7 +1230,7 @@ private struct TodoCard: View {
             Divider().overlay(Palette.border)
             Text("\(completedCount) of \(store.todos.count) complete")
                 .font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.focus)
-            Text("Completed items clear 24 hours after completion.")
+            Text("Checked items clear every day at 4:00 AM.")
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
         }
         .padding(20).background(Palette.panel)

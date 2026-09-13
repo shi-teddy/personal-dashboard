@@ -8,7 +8,7 @@ struct TodoChecks {
 
     static func main() throws {
         try checkOrderingAndDividerDeletion()
-        try checkTwentyFourHourBoundary()
+        try checkDailyFourAMBoundary()
         try checkPersistence()
         print("Todo regression checks passed.")
     }
@@ -72,24 +72,24 @@ struct TodoChecks {
         precondition(subject.todos.map(\.title) == ["Fourth"])
     }
 
-    private static func checkTwentyFourHourBoundary() throws {
+    private static func checkDailyFourAMBoundary() throws {
         let (defaults, suite) = isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }
-        let now = date("2026-09-11T12:00:00-04:00")
+        let beforeCutoff = date("2026-09-12T03:30:00-04:00")
         let todos = [
             TodoItem(title: "Unchecked"),
-            TodoItem(title: "Just inside", completedAt: now.addingTimeInterval(-(24 * 60 * 60) + 1)),
-            TodoItem(title: "Exact boundary", completedAt: now.addingTimeInterval(-24 * 60 * 60)),
-            TodoItem(title: "Older", completedAt: now.addingTimeInterval(-(24 * 60 * 60) - 1))
+            TodoItem(title: "Before previous cutoff", completedAt: date("2026-09-11T03:59:00-04:00")),
+            TodoItem(title: "Yesterday evening", completedAt: date("2026-09-11T20:00:00-04:00")),
+            TodoItem(title: "Early this morning", completedAt: date("2026-09-12T03:00:00-04:00"))
         ]
         defaults.set(try JSONEncoder().encode(todos), forKey: todoKey)
         defaults.set(1, forKey: dividerKey)
 
-        let subject = store(defaults: defaults, now: { now })
-        precondition(subject.todos.map(\.title) == ["Unchecked", "Just inside"])
+        let subject = store(defaults: defaults, now: { beforeCutoff })
+        precondition(subject.todos.map(\.title) == ["Unchecked", "Yesterday evening", "Early this morning"])
         precondition(subject.todoDividerIndex == 1)
 
-        subject.removeExpiredCompletedTodos(now: now.addingTimeInterval(1))
+        subject.removeCompletedTodosAtDailyCutoff(now: date("2026-09-12T04:00:00-04:00"))
         precondition(subject.todos.map(\.title) == ["Unchecked"])
 
         let persisted = try JSONDecoder().decode(
