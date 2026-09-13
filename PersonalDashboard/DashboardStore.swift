@@ -16,6 +16,13 @@ final class DashboardStore: ObservableObject {
     @Published private(set) var goals: [GoalItem] = [] {
         didSet { save(goals, key: goalKey) }
     }
+    @Published private(set) var completedGoals: [CompletedGoalRecord] = [] {
+        didSet { save(completedGoals, key: completedGoalsKey) }
+    }
+    @Published private(set) var todoCompletionHistory: [TodoCompletionRecord] = [] {
+        didSet { save(todoCompletionHistory, key: todoCompletionHistoryKey) }
+    }
+    @Published private(set) var goalCelebration: CompletedGoalRecord?
     @Published private(set) var calendarEvents: [CalendarEvent] = [] {
         didSet { save(calendarEvents, key: calendarKey) }
     }
@@ -32,6 +39,8 @@ final class DashboardStore: ObservableObject {
     private let todoKey = "personal-dashboard.todos.v1"
     private let todoDividerKey = "personal-dashboard.todo-divider-index.v1"
     private let goalKey = "personal-dashboard.goals.v1"
+    private let completedGoalsKey = "personal-dashboard.completed-goals.v1"
+    private let todoCompletionHistoryKey = "personal-dashboard.todo-completion-history.v1"
     private let calendarKey = "personal-dashboard.calendar-events.v1"
     private let stickyNotesKey = "personal-dashboard.sticky-notes.v1"
     private let classificationSubgroupsKey = "personal-dashboard.classification-subgroups.v1"
@@ -53,6 +62,8 @@ final class DashboardStore: ObservableObject {
         self.automaticallySchedulesTodoCleanup = automaticallySchedulesTodoCleanup
         todos = load([TodoItem].self, key: todoKey) ?? Self.sampleTodos
         goals = load([GoalItem].self, key: goalKey) ?? Self.sampleGoals
+        completedGoals = load([CompletedGoalRecord].self, key: completedGoalsKey) ?? []
+        todoCompletionHistory = load([TodoCompletionRecord].self, key: todoCompletionHistoryKey) ?? []
         calendarEvents = load([CalendarEvent].self, key: calendarKey) ?? []
         stickyNotes = load([StickyNote].self, key: stickyNotesKey) ?? []
         classificationSubgroups = load([ClassificationSubgroup].self, key: classificationSubgroupsKey)
@@ -62,6 +73,7 @@ final class DashboardStore: ObservableObject {
             defaults.integer(forKey: todoDividerKey)
         }
         normalizeTodoOrder()
+        migrateCompletionHistory()
         let activeTodoCount = todos.filter { !$0.isCompleted }.count
         if let savedTodoDividerIndex {
             todoDividerIndex = savedTodoDividerIndex.clamped(to: 0...activeTodoCount)
@@ -92,10 +104,12 @@ final class DashboardStore: ObservableObject {
         item.completedAt = item.completedAt == nil ? nowProvider() : nil
         if item.isCompleted {
             todos.append(item)
+            recordTodoCompletion(item)
             if index < dividerIndexBeforeToggle {
                 todoDividerIndex = max(0, dividerIndexBeforeToggle - 1)
             }
         } else {
+            todoCompletionHistory.removeAll { $0.todoID == item.id }
             let firstCompleted = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
             todos.insert(item, at: firstCompleted)
             if dividerWasAtBottom { todoDividerIndex = firstCompleted + 1 }
@@ -229,7 +243,12 @@ final class DashboardStore: ObservableObject {
     func addGoal(title: String, progress: Int) {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
-        goals.append(GoalItem(title: cleaned, progress: progress.clamped(to: 0...100)))
+        let goal = GoalItem(title: cleaned, progress: progress.clamped(to: 0...100))
+        if goal.progress == 100 {
+            archiveCompletedGoal(goal, celebrate: true)
+        } else {
+            goals.append(goal)
+        }
     }
 
     func deleteGoal(_ id: UUID) {
@@ -238,7 +257,17 @@ final class DashboardStore: ObservableObject {
 
     func setGoalProgress(_ id: UUID, progress: Int) {
         guard let index = goals.firstIndex(where: { $0.id == id }) else { return }
-        goals[index].progress = progress.clamped(to: 0...100)
+        let progress = progress.clamped(to: 0...100)
+        if progress == 100 {
+            let goal = goals.remove(at: index)
+            archiveCompletedGoal(goal, celebrate: true)
+        } else {
+            goals[index].progress = progress
+        }
+    }
+
+    func dismissGoalCelebration() {
+        goalCelebration = nil
     }
 
     func addCalendarEvent(
@@ -458,6 +487,50 @@ final class DashboardStore: ObservableObject {
               var host = components.host?.lowercased(), !host.isEmpty else { return nil }
         if host.hasPrefix("www.") { host.removeFirst(4) }
         return host
+    }
+
+    private func recordTodoCompletion(_ todo: TodoItem) {
+        guard let completedAt = todo.completedAt else { return }
+        if let index = todoCompletionHistory.firstIndex(where: { $0.todoID == todo.id }) {
+            todoCompletionHistory[index].title = todo.title
+            todoCompletionHistory[index].completedAt = completedAt
+        } else {
+            todoCompletionHistory.append(TodoCompletionRecord(
+                todoID: todo.id,
+                title: todo.title,
+                completedAt: completedAt
+            ))
+        }
+    }
+
+    private func archiveCompletedGoal(_ goal: GoalItem, celebrate: Bool) {
+        let record: CompletedGoalRecord
+        if let existing = completedGoals.first(where: { $0.goalID == goal.id }) {
+            record = existing
+        } else {
+            record = CompletedGoalRecord(
+                goalID: goal.id,
+                title: goal.title,
+                createdAt: goal.createdAt,
+                completedAt: nowProvider()
+            )
+            completedGoals.append(record)
+        }
+        if celebrate { goalCelebration = record }
+    }
+
+    private func migrateCompletionHistory() {
+        for todo in todos where todo.isCompleted {
+            recordTodoCompletion(todo)
+        }
+        let finishedGoals = goals.filter { $0.progress >= 100 }
+        for goal in finishedGoals {
+            archiveCompletedGoal(goal, celebrate: false)
+        }
+        if !finishedGoals.isEmpty {
+            let finishedIDs = Set(finishedGoals.map(\.id))
+            goals.removeAll { finishedIDs.contains($0.id) }
+        }
     }
 
     private func save<T: Encodable>(_ value: T, key: String) {

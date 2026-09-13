@@ -5,12 +5,14 @@ import Foundation
 struct TodoChecks {
     private static let todoKey = "personal-dashboard.todos.v1"
     private static let dividerKey = "personal-dashboard.todo-divider-index.v1"
+    private static let goalKey = "personal-dashboard.goals.v1"
 
     static func main() throws {
         try checkOrderingAndDividerDeletion()
         try checkDailyFourAMBoundary()
         try checkPersistence()
-        print("Todo regression checks passed.")
+        try checkCompletionInsights()
+        print("Dashboard persistence checks passed.")
     }
 
     private static func date(_ value: String) -> Date {
@@ -87,10 +89,12 @@ struct TodoChecks {
 
         let subject = store(defaults: defaults, now: { beforeCutoff })
         precondition(subject.todos.map(\.title) == ["Unchecked", "Yesterday evening", "Early this morning"])
+        precondition(subject.todoCompletionHistory.map(\.title) == ["Before previous cutoff", "Yesterday evening", "Early this morning"])
         precondition(subject.todoDividerIndex == 1)
 
         subject.removeCompletedTodosAtDailyCutoff(now: date("2026-09-12T04:00:00-04:00"))
         precondition(subject.todos.map(\.title) == ["Unchecked"])
+        precondition(subject.todoCompletionHistory.count == 3)
 
         let persisted = try JSONDecoder().decode(
             [TodoItem].self,
@@ -121,5 +125,36 @@ struct TodoChecks {
         restored.addTodo(title: "New active")
         precondition(restored.todos.map(\.title) == ["Keep active", "New active", "Keep completed"])
         precondition(restored.todoDividerIndex == 2)
+    }
+
+    private static func checkCompletionInsights() throws {
+        let (defaults, suite) = isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = date("2026-09-11T14:00:00-04:00")
+        defaults.set(try JSONEncoder().encode([TodoItem]()), forKey: todoKey)
+        defaults.set(try JSONEncoder().encode([GoalItem]()), forKey: goalKey)
+        var subject: DashboardStore? = store(defaults: defaults, now: { now })
+
+        subject!.addTodo(title: "Finish reading")
+        let todoID = subject!.todos[0].id
+        subject!.toggleTodo(todoID)
+        precondition(subject!.todoCompletionHistory.map(\.title) == ["Finish reading"])
+        subject!.toggleTodo(todoID)
+        precondition(subject!.todoCompletionHistory.isEmpty)
+        subject!.toggleTodo(todoID)
+
+        subject!.addGoal(title: "Ship dashboard", progress: 90)
+        let goalID = subject!.goals[0].id
+        subject!.setGoalProgress(goalID, progress: 100)
+        precondition(subject!.goals.isEmpty)
+        precondition(subject!.completedGoals.map(\.title) == ["Ship dashboard"])
+        precondition(subject!.goalCelebration?.title == "Ship dashboard")
+        subject!.dismissGoalCelebration()
+        precondition(subject!.goalCelebration == nil)
+        subject = nil
+
+        let restored = store(defaults: defaults, now: { now.addingTimeInterval(60) })
+        precondition(restored.todoCompletionHistory.map(\.title) == ["Finish reading"])
+        precondition(restored.completedGoals.map(\.title) == ["Ship dashboard"])
     }
 }

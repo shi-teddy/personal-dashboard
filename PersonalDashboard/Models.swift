@@ -16,6 +16,21 @@ struct GoalItem: Identifiable, Codable, Equatable {
     var createdAt = Date()
 }
 
+struct CompletedGoalRecord: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var goalID: UUID
+    var title: String
+    var createdAt: Date
+    var completedAt: Date
+}
+
+struct TodoCompletionRecord: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var todoID: UUID
+    var title: String
+    var completedAt: Date
+}
+
 enum CalendarEventTag: String, Codable, CaseIterable, Identifiable {
     case school
     case college

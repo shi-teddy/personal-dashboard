@@ -701,6 +701,13 @@ private struct InsightDaySummary: Identifiable {
     var id: Date { date }
 }
 
+private struct TodoInsightDay: Identifiable {
+    let date: Date
+    let count: Int
+
+    var id: Date { date }
+}
+
 private struct InsightActivityTotal: Identifiable {
     let id: String
     let name: String
@@ -713,9 +720,12 @@ private struct InsightsPage: View {
     @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
     @State private var anchorDate = Date()
+    @State private var days: [InsightDaySummary] = []
+    @State private var topActivities: [InsightActivityTotal] = []
+    private let refreshTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
     private let calendar = Calendar.current
 
-    private var days: [InsightDaySummary] {
+    private func makeDays() -> [InsightDaySummary] {
         let end = tracker.trackingDay(containing: anchorDate)
         return (-6...0).compactMap { offset in
             guard let date = calendar.date(byAdding: .day, value: offset, to: end) else { return nil }
@@ -750,7 +760,7 @@ private struct InsightsPage: View {
             .max { $0.productivity.score < $1.productivity.score }
     }
 
-    private var topActivities: [InsightActivityTotal] {
+    private func makeTopActivities() -> [InsightActivityTotal] {
         var totals: [String: InsightActivityTotal] = [:]
         for day in days {
             for activity in tracker.topActivities(
@@ -778,69 +788,102 @@ private struct InsightsPage: View {
             .map { $0 }
     }
 
+    private var todoDays: [TodoInsightDay] {
+        days.map { day in
+            TodoInsightDay(
+                date: day.date,
+                count: store.todoCompletionHistory.filter {
+                    calendar.isDate($0.completedAt, inSameDayAs: day.date)
+                }.count
+            )
+        }
+    }
+
     var body: some View {
         let summary = totalSummary
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Insights").font(.system(size: 26, weight: .bold))
-                    Text(rangeLabel).font(.system(size: 12)).foregroundStyle(Palette.muted)
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Insights").font(.system(size: 26, weight: .bold))
+                        Text(rangeLabel).font(.system(size: 12)).foregroundStyle(Palette.muted)
+                    }
+                    Spacer()
+                    InsightNavigationButton(symbol: "chevron.left", help: "Previous week") { moveWeek(-1) }
+                    Button("This week") { anchorDate = Date() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 82, height: 34)
+                        .background(Palette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 9).stroke(Palette.border, lineWidth: 1))
+                    InsightNavigationButton(symbol: "chevron.right", help: "Next week") { moveWeek(1) }
                 }
-                Spacer()
-                InsightNavigationButton(symbol: "chevron.left", help: "Previous week") { moveWeek(-1) }
-                Button("This week") { anchorDate = Date() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 82, height: 34)
-                    .background(Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(Palette.border, lineWidth: 1))
-                InsightNavigationButton(symbol: "chevron.right", help: "Next week") { moveWeek(1) }
+                .padding(.bottom, 6)
             }
+            .padding(24)
 
-            HStack(spacing: 14) {
-                InsightMetricCard(
-                    title: "Total screen time",
-                    value: tracker.shortDuration(summary.totalDuration),
-                    detail: "Across seven days",
-                    symbol: "clock"
-                )
-                InsightMetricCard(
-                    title: "Flow time",
-                    value: tracker.shortDuration(summary.focusDuration),
-                    detail: percentageDetail(summary.focusDuration, total: summary.totalDuration),
-                    symbol: "bolt.fill"
-                )
-                InsightMetricCard(
-                    title: "Average score",
-                    value: "\(averageScore)%",
-                    detail: "On active days",
-                    symbol: "gauge.with.dots.needle.50percent"
-                )
-                InsightMetricCard(
-                    title: "Best day",
-                    value: bestDay?.date.formatted(.dateTime.weekday(.abbreviated)) ?? "—",
-                    detail: bestDay.map { "\($0.productivity.score)% productivity" } ?? "No activity yet",
-                    symbol: "trophy"
-                )
-            }
-            .frame(height: 112)
+            ScrollView {
+              VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 14) {
+                    InsightMetricCard(
+                        title: "Total screen time",
+                        value: tracker.shortDuration(summary.totalDuration),
+                        detail: "Across seven days",
+                        symbol: "clock"
+                    )
+                    InsightMetricCard(
+                        title: "Flow time",
+                        value: tracker.shortDuration(summary.focusDuration),
+                        detail: percentageDetail(summary.focusDuration, total: summary.totalDuration),
+                        symbol: "bolt.fill"
+                    )
+                    InsightMetricCard(
+                        title: "Average score",
+                        value: "\(averageScore)%",
+                        detail: "On active days",
+                        symbol: "gauge.with.dots.needle.50percent"
+                    )
+                    InsightMetricCard(
+                        title: "Best day",
+                        value: bestDay?.date.formatted(.dateTime.weekday(.abbreviated)) ?? "—",
+                        detail: bestDay.map { "\($0.productivity.score)% productivity" } ?? "No activity yet",
+                        symbol: "trophy"
+                    )
+                }
+                .frame(height: 112)
 
-            HStack(alignment: .top, spacing: 18) {
-                InsightTrendCard(days: days)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                VStack(spacing: 18) {
+                HStack(alignment: .top, spacing: 18) {
+                    InsightTrendCard(days: days)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 280)
+                    TodoCompletionInsightCard(days: todoDays)
+                        .frame(height: 280)
+                }
+                HStack(alignment: .top, spacing: 18) {
                     InsightBreakdownCard(summary: summary)
                     InsightTopActivitiesCard(activities: topActivities)
                 }
-                .frame(width: 350)
+                .frame(height: 230)
+                CompletedGoalsInsightCard(records: store.completedGoals)
+              }
+              .padding(.horizontal, 24)
+              .padding(.bottom, 24)
             }
         }
-        .padding(24)
+        .onAppear(perform: refreshInsights)
+        .onChange(of: anchorDate) { _ in refreshInsights() }
+        .onChange(of: store.classificationRules) { _ in refreshInsights() }
+        .onReceive(refreshTimer) { _ in refreshInsights() }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Palette.panel)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
+    }
+
+    private func refreshInsights() {
+        days = makeDays()
+        topActivities = makeTopActivities()
     }
 
     private var rangeLabel: String {
@@ -855,6 +898,112 @@ private struct InsightsPage: View {
     private func percentageDetail(_ value: TimeInterval, total: TimeInterval) -> String {
         guard total > 0 else { return "No classified time" }
         return "\(Int((value / total * 100).rounded()))% of tracked time"
+    }
+}
+
+private struct CompletedGoalsInsightCard: View {
+    let records: [CompletedGoalRecord]
+
+    private var newestFirst: [CompletedGoalRecord] {
+        records.sorted { $0.completedAt > $1.completedAt }
+    }
+
+    var body: some View {
+        HStack(spacing: 18) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Image(systemName: "trophy.fill").foregroundStyle(Palette.focus)
+                    Text("Goals completed").font(.system(size: 16, weight: .semibold))
+                }
+                Text("\(records.count)")
+                    .font(.system(size: 34, weight: .bold))
+                    .monospacedDigit()
+                Text("Permanent achievement record")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Palette.muted)
+            }
+            .frame(width: 190, alignment: .leading)
+
+            Divider().padding(.vertical, 4)
+
+            if newestFirst.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "flag.checkered").font(.system(size: 20)).foregroundStyle(Palette.muted)
+                    Text("Completed goals will appear here.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.muted)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                    VStack(spacing: 14) {
+                        ForEach(newestFirst) { record in
+                            HStack(spacing: 9) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Palette.focus)
+                                Text(record.title)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer()
+                                Text(record.completedAt.formatted(.dateTime.month(.abbreviated).day().year()))
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(Palette.muted)
+                            }
+                        }
+                    }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 130, alignment: .leading)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
+    }
+}
+
+private struct TodoCompletionInsightCard: View {
+    let days: [TodoInsightDay]
+
+    private var total: Int { days.reduce(0) { $0 + $1.count } }
+    private var average: Double { days.isEmpty ? 0 : Double(total) / Double(days.count) }
+    private var maximum: Int { max(1, days.map(\.count).max() ?? 1) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Todos completed").font(.system(size: 16, weight: .semibold))
+                    Text("Seven-day average").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                }
+                Spacer()
+                Text(average.formatted(.number.precision(.fractionLength(1))))
+                    .font(.system(size: 28, weight: .bold))
+                    .monospacedDigit()
+                Text("/ day").font(.system(size: 10, weight: .semibold)).foregroundStyle(Palette.muted)
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                ForEach(days) { day in
+                    VStack(spacing: 4) {
+                        Spacer(minLength: 0)
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(Palette.focus.opacity(day.count == 0 ? 0.18 : 0.85))
+                            .frame(height: max(3, 130 * CGFloat(day.count) / CGFloat(maximum)))
+                        Text(day.date.formatted(.dateTime.weekday(.narrow)))
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Palette.muted)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            Text("\(total) completed in this period")
+                .font(.system(size: 9))
+                .foregroundStyle(Palette.muted)
+        }
+        .padding(16)
+        .frame(width: 350)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
     }
 }
 
@@ -995,12 +1144,15 @@ private struct InsightBreakdownCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Classification breakdown").font(.system(size: 16, weight: .semibold))
+            Spacer(minLength: 0)
             InsightBreakdownRow(name: "Flow", duration: summary.focusDuration, total: summary.totalDuration, color: Palette.focus)
+            Spacer(minLength: 0)
             InsightBreakdownRow(name: "Neutral", duration: summary.neutralDuration, total: summary.totalDuration, color: Palette.neutral)
+            Spacer(minLength: 0)
             InsightBreakdownRow(name: "Brainrot", duration: summary.driftDuration, total: summary.totalDuration, color: Palette.warning)
         }
         .padding(16)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Palette.border, lineWidth: 1))
@@ -1118,6 +1270,18 @@ private struct GoalsCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.border, lineWidth: 1))
         .sheet(isPresented: $showingAddGoal) { AddGoalSheet(isPresented: $showingAddGoal) }
+        .alert("Yay! 🎉", isPresented: celebrationIsPresented) {
+            Button("Awesome") { store.dismissGoalCelebration() }
+        } message: {
+            Text("You completed \(store.goalCelebration?.title ?? "your goal")! It has been saved permanently in Insights.")
+        }
+    }
+
+    private var celebrationIsPresented: Binding<Bool> {
+        Binding(
+            get: { store.goalCelebration != nil },
+            set: { if !$0 { store.dismissGoalCelebration() } }
+        )
     }
 }
 
