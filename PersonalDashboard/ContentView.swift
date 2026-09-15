@@ -236,7 +236,7 @@ private struct TrackedTimeCard: View {
                 Spacer()
                 MetricLegend(label: "FOCUS", color: Palette.focus)
                 MetricLegend(label: "NEUTRAL", color: Palette.neutral)
-                MetricLegend(label: "DRIFT", color: Palette.drift)
+                MetricLegend(label: "DRIFT", color: Palette.warning)
                 Spacer()
                 HStack(spacing: 5) {
                     ChartDayButton(symbol: "chevron.left", help: "Previous day") { moveDay(-1) }
@@ -1302,9 +1302,13 @@ private struct GoalRow: View {
                     Text("\(goal.progress)%")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(Palette.focus)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .monospacedDigit()
                 }
                 .buttonStyle(.plain)
                 .help("Edit progress")
+                .frame(minWidth: 38, alignment: .trailing)
                 Button { store.deleteGoal(goal.id) } label: { Image(systemName: "trash").font(.system(size: 11)) }
                     .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Delete goal")
             }

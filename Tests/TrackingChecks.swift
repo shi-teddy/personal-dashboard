@@ -16,6 +16,8 @@ struct TrackingChecks {
         try checkChronologicalFocusDrift(in: root, defaults: defaults)
         try checkStableChartTie(in: root, defaults: defaults)
         try checkUnsampledTimeIsNotRecorded(in: root, defaults: defaults)
+        try checkBatchingAndCaches(in: root, defaults: defaults)
+        checkOverlappingSamples(in: root, defaults: defaults)
         print("Tracking regression checks passed.")
     }
 
@@ -168,6 +170,83 @@ struct TrackingChecks {
         now = date("2026-09-12T05:00:00-04:00")
         subject.resumeTracking(from: .sessionInactive, now: now)
         precondition(subject.sessions.count == 3 && subject.sessions[1].duration == 0)
+    }
+
+    private static func checkBatchingAndCaches(in root: URL, defaults: UserDefaults) throws {
+        let storage = root.appendingPathComponent("batching.json")
+        var now = date("2026-09-11T12:00:00-04:00")
+        let subject = tracker(storageURL: storage, now: { now }, defaults: defaults,
+            samples: { ScreenTimeActivitySample(appName: "Flow", bundleIdentifier: "test.flow", websiteDomain: nil) })
+        for _ in 0..<12 {
+            subject.recordSample(now: now)
+            now = now.addingTimeInterval(5)
+        }
+        precondition(subject.persistenceWriteCount == 2)
+        let flow = [rule("Flow", "test.flow", .flow)]
+        let summary = subject.productivitySummary(for: now, classificationRules: flow)
+        let chart = subject.chartSegments(for: now, classificationRules: flow)
+        let points = subject.focusDriftPoints(for: now, classificationRules: flow)
+        let activities = subject.topActivities(for: now, classificationRules: flow)
+        let count = subject.analyticsComputationCount
+        for _ in 0..<10 {
+            precondition(subject.productivitySummary(for: now, classificationRules: flow) == summary)
+            precondition(subject.chartSegments(for: now, classificationRules: flow) == chart)
+            precondition(subject.focusDriftPoints(for: now, classificationRules: flow) == points)
+            precondition(subject.topActivities(for: now, classificationRules: flow) == activities)
+        }
+        precondition(subject.analyticsComputationCount == count)
+        let drift = [rule("Flow", "test.flow", .brainrot)]
+        precondition(subject.productivitySummary(for: now, classificationRules: drift).driftDuration == summary.focusDuration)
+        precondition(subject.chartSegments(for: now, classificationRules: drift).allSatisfy { $0.classification == .brainrot })
+        precondition(subject.focusDriftPoints(for: now, classificationRules: drift).last!.driftScore > 0)
+        precondition(subject.topActivities(for: now, classificationRules: drift).first!.classification == .brainrot)
+        subject.recordSample(now: now)
+        precondition(subject.productivitySummary(for: now, classificationRules: flow).totalDuration > summary.totalDuration)
+        subject.flushPersistence()
+        let writes = subject.persistenceWriteCount
+        subject.flushPersistence()
+        precondition(subject.persistenceWriteCount == writes)
+        let reloaded = tracker(storageURL: storage, now: { now }, defaults: defaults)
+        precondition(subject.sessions == reloaded.sessions)
+        precondition(subject.chartSegments(for: now, classificationRules: flow) == reloaded.chartSegments(for: now, classificationRules: flow))
+        subject.clearHistory()
+        precondition(subject.productivitySummary(for: now, classificationRules: flow).totalDuration == 0)
+        precondition(subject.chartSegments(for: now, classificationRules: flow).isEmpty)
+        precondition(subject.focusDriftPoints(for: now, classificationRules: flow).isEmpty)
+        precondition(subject.topActivities(for: now, classificationRules: flow).isEmpty)
+        let lifecycle = ScreenTimeTracker(defaults: defaults, storageURL: root.appendingPathComponent("lifecycle.json"),
+            nowProvider: { now }, activitySampleProvider: { nil }, idleSecondsProvider: { 0 })
+        precondition(lifecycle.hasSamplingTimer)
+        lifecycle.suspendTracking(for: .systemSleep, now: now)
+        precondition(!lifecycle.hasSamplingTimer)
+        lifecycle.resumeTracking(from: .systemSleep, now: now)
+        precondition(lifecycle.hasSamplingTimer)
+        lifecycle.prepareForTermination()
+        precondition(!lifecycle.hasSamplingTimer)
+        print("PASS: batching, explicit flush, unchanged-write suppression, session/rule/clear cache invalidation")
+    }
+
+    private static func checkOverlappingSamples(in root: URL, defaults: UserDefaults) {
+        let now = date("2026-09-11T12:00:00-04:00")
+        let subject = tracker(storageURL: root.appendingPathComponent("overlap.json"), now: { now }, defaults: defaults)
+        var finished = false
+        Task { @MainActor in
+            var resume: CheckedContinuation<ScreenTimeActivitySample?, Never>?
+            let pending = Task { @MainActor in
+                await subject.requestSample(provider: { await withCheckedContinuation { resume = $0 } })
+            }
+            while resume == nil { await Task.yield() }
+            await subject.requestSample(provider: { preconditionFailure("Overlapping sample") })
+            subject.suspendTracking(for: .sessionInactive, now: now)
+            resume?.resume(returning: ScreenTimeActivitySample(appName: "Stale", bundleIdentifier: "test.stale", websiteDomain: nil))
+            await pending.value
+            precondition(subject.sessions.isEmpty && !subject.sampleInFlight)
+            finished = true
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !finished && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        precondition(finished)
+        print("PASS: overlapping samples prevented; pre-lock replies discarded")
     }
 
     private static func rule(

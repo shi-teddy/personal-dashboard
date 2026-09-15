@@ -44,9 +44,15 @@ struct CatGait {
 
 struct FocusCatView: View {
     @ObservedObject var controller: FocusCatController
+    @ObservedObject private var animation: CatAnimationState
+
+    init(controller: FocusCatController) {
+        self.controller = controller
+        self.animation = controller.animation
+    }
     var body: some View {
         WhiteFocusCat(pose: controller.pose, facingRight: controller.facingRight,
-                      phase: controller.animationPhase, isSprinting: controller.isSprinting,
+                      phase: animation.phase, isSprinting: controller.isSprinting,
                       isDeparting: controller.isDeparting)
             .frame(width: CatLayout.drawingSize.width, height: CatLayout.drawingSize.height)
             .frame(width: CatLayout.panelSize.width, height: CatLayout.panelSize.height, alignment: .bottom)

@@ -34,6 +34,12 @@ Run `Tools/test-todos.sh`, `Tools/test-tracking.sh`, and `Tools/test-focus-cat.s
 
 ## Focus Cat animation
 
+Performance measurements, cache invalidation rules, polling behavior and validation
+limits are documented in [PERFORMANCE.md](PERFORMANCE.md). Run
+`Tools/benchmark-performance.sh` for an isolated native idle/preview and synthetic
+tracking benchmark. Visible transitions use 60 Hz updates; the sleeping cat keeps
+its subtle breathing at 4 Hz without invalidating the dashboard.
+
 Focus Cat uses the approved `workcat-v3/workcat_final.gif` animation: wrapped sleeping tail,
 closed sleeping eyes and mouth, the same walking gait in both directions, and the restored
 GIF paw raise. All seven animation clips are bundled in

@@ -7,7 +7,7 @@ if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]
     export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
 cd "$project_root"
-xcrun swiftc -module-cache-path "$check_root/modules" \
+xcrun swiftc PersonalDashboard/BrowserScriptRunner.swift -module-cache-path "$check_root/modules" \
     PersonalDashboard/Models.swift PersonalDashboard/ScreenTimeTracker.swift Tests/TrackingChecks.swift \
     -o "$check_root/TrackingChecks"
 TZ=America/New_York "$check_root/TrackingChecks"

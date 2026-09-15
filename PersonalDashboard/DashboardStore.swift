@@ -90,9 +90,11 @@ final class DashboardStore: ObservableObject {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         let activeTodoCount = todos.firstIndex(where: \.isCompleted) ?? todos.endIndex
-        let dividerWasAtBottom = todoDividerIndex == activeTodoCount
-        todos.insert(TodoItem(title: cleaned, createdAt: nowProvider()), at: activeTodoCount)
-        if dividerWasAtBottom { todoDividerIndex = activeTodoCount + 1 }
+        // A new task belongs to the backlog, so place it immediately after the
+        // today/backlog divider. Keep the divider fixed: it still separates the
+        // same set of today's tasks from the new first backlog task.
+        let insertionIndex = todoDividerIndex.clamped(to: 0...activeTodoCount)
+        todos.insert(TodoItem(title: cleaned, createdAt: nowProvider()), at: insertionIndex)
     }
 
     func toggleTodo(_ id: UUID) {

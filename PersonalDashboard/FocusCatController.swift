@@ -25,14 +25,23 @@ private final class FocusCatPanel: NSPanel {
 }
 
 @MainActor
+final class CatAnimationState: ObservableObject {
+    @Published var phase = 0.0
+}
+
+@MainActor
 final class FocusCatController: ObservableObject {
     @Published private(set) var pose: FocusCatPose = .sleeping
     @Published private(set) var facingRight = true
-    @Published private(set) var animationPhase = 0.0
+    let animation = CatAnimationState()
+    var animationPhase: Double {
+        get { animation.phase }
+        set { animation.phase = newValue }
+    }
     @Published private(set) var statusText = ""
     @Published private(set) var isEnabled: Bool
 
-    struct ChromeTarget: Equatable {
+    struct ChromeTarget: Equatable, Sendable {
         let windowID: String
         let tabID: String
         let bundleIdentifier: String
@@ -41,6 +50,7 @@ final class FocusCatController: ObservableObject {
         let title: String
         let windowBounds: CGRect
         let label: String
+        var closeContact: CGPoint? = nil
     }
 
     private enum Intervention {
@@ -60,9 +70,21 @@ final class FocusCatController: ObservableObject {
     private let defaults: UserDefaults
     private let browserMonitoringEnabled: Bool
     private let clock: () -> Date
+    private let browserAvailable: () -> Bool
     private var panel: FocusCatPanel?
     private var movementTimer: Timer?
     private var detectionTimer: Timer?
+    private var idleTimer: Timer?
+    private var browserObservers: [NSObjectProtocol] = []
+    private var browserGeneration = 0
+    private var closeCancellation: BrowserRequestCancellation?
+    private(set) var browserScanInFlight = false
+    private(set) var browserScanCount = 0
+    private(set) var animationTimerCallbacks = 0
+    private(set) var idleTimerCallbacks = 0
+    private(set) var detectionInterval: TimeInterval = 2.5
+    var hasMovementTimer: Bool { movementTimer != nil }
+    var hasIdleTimer: Bool { idleTimer != nil }
     private var lastTick = Date()
     private var stalledTravelTime = 0.0
     private var travelSpeed = 0.0
@@ -85,10 +107,16 @@ final class FocusCatController: ObservableObject {
     private var hasStarted = false
 
     init(defaults: UserDefaults = .standard, browserMonitoringEnabled: Bool = true,
-         clock: @escaping () -> Date = Date.init) {
+         clock: @escaping () -> Date = Date.init,
+         browserAvailable: @escaping () -> Bool = {
+             NSWorkspace.shared.frontmostApplication?.bundleIdentifier.map {
+                 FocusCatController.chromeBundleIdentifiers.contains($0)
+             } ?? false
+         }) {
         self.defaults = defaults
         self.browserMonitoringEnabled = browserMonitoringEnabled
         self.clock = clock
+        self.browserAvailable = browserAvailable
         if defaults.object(forKey: enabledKey) == nil {
             isEnabled = true
         } else {
@@ -173,26 +201,69 @@ final class FocusCatController: ObservableObject {
     }
 
     private func startTimers() {
+        updateAnimationTimer()
+        guard browserMonitoringEnabled, browserObservers.isEmpty else { return }
+        for name in [NSWorkspace.didActivateApplicationNotification,
+                     NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            browserObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.isEnabled else { return }
+                    self.detectionInterval = 2.5
+                    self.scheduleDetection(after: 0)
+                }
+            })
+        }
+        scheduleDetection(after: 0)
+    }
+
+    private func updateAnimationTimer() {
+        guard isEnabled else { return }
+        if pose == .sleeping {
+            movementTimer?.invalidate()
+            movementTimer = nil
+            guard idleTimer == nil else { return }
+            lastTick = clock()
+            // The authored sleeping clip breathes by a fraction of a point.
+            // Retain its 2.4-second phase at 4 Hz without waking the whole app.
+            let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.idleTimerCallbacks += 1
+                    self.movementTick()
+                }
+            }
+            timer.tolerance = 0.025
+            RunLoop.main.add(timer, forMode: .common)
+            idleTimer = timer
+            return
+        }
+        idleTimer?.invalidate()
+        idleTimer = nil
         guard movementTimer == nil else { return }
         lastTick = clock()
         let movementTimer = Timer(timeInterval: CatGait.updateInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.movementTick() }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.animationTimerCallbacks += 1
+                self.movementTick()
+            }
         }
         RunLoop.main.add(movementTimer, forMode: .common)
         self.movementTimer = movementTimer
 
-        guard browserMonitoringEnabled else { return }
-        let detectionTimer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.scanChrome() }
-        }
-        RunLoop.main.add(detectionTimer, forMode: .common)
-        self.detectionTimer = detectionTimer
-        scanChrome()
     }
 
     private func stopTimers() {
+        closeCancellation?.cancel()
         movementTimer?.invalidate()
         detectionTimer?.invalidate()
+        idleTimer?.invalidate()
+        idleTimer = nil
+        browserGeneration += 1
+        for observer in browserObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        browserObservers.removeAll()
         movementTimer = nil
         detectionTimer = nil
     }
@@ -200,11 +271,13 @@ final class FocusCatController: ObservableObject {
     func movementTick(now suppliedTime: Date? = nil) {
         let now = suppliedTime ?? clock()
         guard isEnabled, let panel else { return }
-        let elapsed = min(0.1, max(0, now.timeIntervalSince(lastTick)))
+        let elapsed = pose == .sleeping ? max(0, now.timeIntervalSince(lastTick))
+            : min(0.1, max(0, now.timeIntervalSince(lastTick)))
         lastTick = now
+        defer { updateAnimationTimer() }
 
         if browserMonitoringEnabled, now.timeIntervalSince(lastTargetCheck) >= 0.35 {
-            checkInterventionTarget(now: now)
+            requestTargetCheck(now: now)
         }
 
         switch pose {
@@ -257,8 +330,8 @@ final class FocusCatController: ObservableObject {
                 movePanel(to: destinationOrigin)
                 finishTravel(now: now)
             } else {
-                if abs(dx) > 1 { facingRight = dx > 0 }
-                pose = .running
+                if abs(dx) > 1, facingRight != (dx > 0) { facingRight = dx > 0 }
+                if pose != .running { pose = .running }
                 let previousOrigin = panel.frame.origin
                 movePanel(to: CGPoint(
                     x: previousOrigin.x + dx / distance * step,
@@ -313,6 +386,7 @@ final class FocusCatController: ObservableObject {
         pose = .waking
         animationPhase = 0
         wakeEndsAt = now.addingTimeInterval(CatLayout.settleDuration)
+        updateAnimationTimer()
         if let intervention { statusText = "Waking up — \(intervention.label) spotted" }
     }
 
@@ -333,12 +407,27 @@ final class FocusCatController: ObservableObject {
         let elapsed = max(0, now.timeIntervalSince(startedAt))
         animationPhase = min(CatLayout.reachDuration, elapsed)
 
-        if elapsed >= CatLayout.closeTime, !closeAttempted {
+        if elapsed >= CatLayout.closeTime, !closeAttempted, !browserScanInFlight {
             closeAttempted = true
             switch intervention {
             case .chrome(let target):
-                let succeeded = closeChromeTab(target)
-                statusText = succeeded ? "Closed \(target.label)" : "Tab changed — leaving it alone"
+                let generation = browserGeneration
+                let cancellation = BrowserRequestCancellation()
+                closeCancellation = cancellation
+                browserScanInFlight = true
+                Task { [weak self] in
+                    let succeeded = await BrowserScriptRunner.shared.perform {
+                        Self.performClose(target) { source in
+                            guard !cancellation.isCancelled else { return nil }
+                            return BrowserScriptRunner.execute(source)
+                        }
+                    }
+                    guard let self else { return }
+                    self.browserScanInFlight = false
+                    guard self.isEnabled, generation == self.browserGeneration,
+                          case .chrome(let current) = self.intervention, current == target else { return }
+                    self.statusText = succeeded ? "Closed \(target.label)" : "Tab changed — leaving it alone"
+                }
             case .preview:
                 statusText = "Got it!"
             case .none:
@@ -355,6 +444,7 @@ final class FocusCatController: ObservableObject {
     }
 
     private func beginReturnHome() {
+        closeCancellation?.cancel()
         guard let panel else { return }
         intervention = nil
         wakeEndsAt = nil
@@ -402,6 +492,8 @@ final class FocusCatController: ObservableObject {
     }
 
     private func resetToSleep() {
+        closeCancellation?.cancel()
+        browserGeneration += 1
         stalledTravelTime = 0
         travelSpeed = 0
         travelPhasePerPoint = 0
@@ -419,10 +511,39 @@ final class FocusCatController: ObservableObject {
         facingRight = true
     }
 
-    private func scanChrome(now: Date = Date()) {
-        guard isEnabled, pose == .sleeping, intervention == nil, !isReturningHome,
-              now.timeIntervalSince(lastHandledAt) > 4,
-              let target = activeChromeTarget() else { return }
+    private func scheduleDetection(after delay: TimeInterval) {
+        detectionTimer?.invalidate()
+        detectionTimer = nil
+        guard isEnabled, browserMonitoringEnabled, browserAvailable() else { return }
+        let timer = Timer(timeInterval: max(0.01, delay), repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                await self.scanChrome()
+                self.scheduleDetection(after: self.detectionInterval)
+            }
+        }
+        timer.tolerance = min(0.5, delay * 0.1)
+        RunLoop.main.add(timer, forMode: .common)
+        detectionTimer = timer
+    }
+
+    func scanChrome(now: Date? = nil, provider: (() async -> ChromeTarget?)? = nil) async {
+        let now = now ?? clock()
+        guard isEnabled, browserMonitoringEnabled, browserAvailable(),
+              pose == .sleeping, intervention == nil, !isReturningHome,
+              !browserScanInFlight, now.timeIntervalSince(lastHandledAt) > 4 else { return }
+        browserScanInFlight = true
+        browserScanCount += 1
+        let generation = browserGeneration
+        let target: ChromeTarget?
+        if let provider { target = await provider() } else { target = await activeChromeTarget() }
+        browserScanInFlight = false
+        guard generation == browserGeneration, isEnabled, pose == .sleeping else { return }
+        guard let target else {
+            detectionInterval = min(10, detectionInterval * 2)
+            return
+        }
+        detectionInterval = 2.5
         guard target.url != lastHandledURL || now.timeIntervalSince(lastHandledAt) > 15 else { return }
 
         lastHandledURL = target.url
@@ -441,7 +562,7 @@ final class FocusCatController: ObservableObject {
     /// Keep the existing tab-position estimate, but aim at the trailing close
     /// control rather than placing the cat's center underneath the tab center.
     private func closeContactPoint(for target: ChromeTarget) -> CGPoint {
-        if let exact = accessibleCloseContact(for: target) { return exact }
+        if let exact = target.closeContact { return exact }
         let tabWidth: CGFloat = 150
         let closeX = min(
             target.windowBounds.maxX - 42,
@@ -456,7 +577,7 @@ final class FocusCatController: ObservableObject {
 
     /// Read only browser chrome, never page content. No permission prompts or
     /// new close APIs: this supplies coordinates to the existing intervention.
-    private func accessibleCloseContact(for target: ChromeTarget) -> CGPoint? {
+    nonisolated private static func accessibleCloseContact(for target: ChromeTarget, primaryTop: CGFloat) -> CGPoint? {
         guard AXIsProcessTrusted(),
               let process = NSRunningApplication.runningApplications(withBundleIdentifier: target.bundleIdentifier).first else { return nil }
         let application = AXUIElementCreateApplication(process.processIdentifier)
@@ -499,7 +620,6 @@ final class FocusCatController: ObservableObject {
                               size.width > 0, size.height > 0 else { continue }
                         // Accessibility coordinates use the primary display's
                         // top-left origin, including for secondary monitors.
-                        let primaryTop=NSScreen.screens.first?.frame.maxY ?? 0
                         return CGPoint(x:origin.x+size.width/2,
                                        y:primaryTop-origin.y-size.height/2)
                     }
@@ -563,12 +683,13 @@ final class FocusCatController: ObservableObject {
         hypot(end.x - start.x, end.y - start.y)
     }
 
-    private func activeChromeTarget() -> ChromeTarget? {
+    private func activeChromeTarget() async -> ChromeTarget? {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
               let bundleIdentifier = frontmost.bundleIdentifier,
               Self.chromeBundleIdentifiers.contains(bundleIdentifier) else { return nil }
 
         let script = """
+        if application id "\(bundleIdentifier)" is not running then return ""
         tell application id "\(bundleIdentifier)"
             if (count of windows) is 0 then return ""
             set targetWindowID to id of front window
@@ -584,10 +705,15 @@ final class FocusCatController: ObservableObject {
         end tell
         """
 
-        var error: NSDictionary?
-        let result = NSAppleScript(source: script)?.executeAndReturnError(&error).stringValue
-        if let error {
-            let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        let response = await BrowserScriptRunner.shared.perform { () -> (String?, Int?) in
+            var error: NSDictionary?
+            let result = NSAppleScript(source: "with timeout of 2 seconds\n\(script)\nend timeout")?
+                .executeAndReturnError(&error).stringValue
+            return (result, error?[NSAppleScript.errorNumber] as? Int)
+        }
+        guard isEnabled else { return nil }
+        let result = response.0
+        if let code = response.1 {
             statusText = code == -1743
                 ? "Allow Chrome control in System Settings → Privacy & Security → Automation"
                 : "Chrome check failed (\(code))"
@@ -607,7 +733,7 @@ final class FocusCatController: ObservableObject {
               let bottom = Double(parts[6]),
               let label = Self.distractionLabel(for: parts[1]) else { return nil }
 
-        return ChromeTarget(
+        var target = ChromeTarget(
             windowID: parts[7], tabID: parts[8],
             bundleIdentifier: bundleIdentifier,
             tabIndex: tabIndex,
@@ -616,14 +742,23 @@ final class FocusCatController: ObservableObject {
             windowBounds: CGRect(x: left, y: top, width: right - left, height: bottom - top),
             label: label
         )
+        // Resolve browser chrome once per trip, on the same serial worker as
+        // Apple events. Reuse this contact at the paw instead of blocking a frame
+        // on a second accessibility-tree traversal.
+        let unresolved = target
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        target.closeContact = await BrowserScriptRunner.shared.perform {
+            Self.accessibleCloseContact(for: unresolved, primaryTop: primaryTop)
+        }
+        return target
     }
 
-    static func scriptLiteral(_ value: String) -> String {
+    nonisolated static func scriptLiteral(_ value: String) -> String {
         "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
-    static func identityGuard(for target: ChromeTarget) -> String {
+    nonisolated static func identityGuard(for target: ChromeTarget) -> String {
         // Chrome's scripting dictionary declares these IDs as TEXT. Comparing
         // them to integer literals incorrectly rejects the very same tab.
         """
@@ -639,6 +774,7 @@ final class FocusCatController: ObservableObject {
         guard case .chrome(let target) = intervention, !closeAttempted,
               pose == .waking || pose == .running || pose == .reaching else { return }
         let script = """
+        if application id "\(target.bundleIdentifier)" is not running then return "changed"
         tell application id "\(target.bundleIdentifier)"
             \(Self.identityGuard(for: target))
             return URL of active tab of front window
@@ -650,7 +786,39 @@ final class FocusCatController: ObservableObject {
         cancelIntervention(now: now)
     }
 
+    private func requestTargetCheck(now: Date) {
+        guard !browserScanInFlight, case .chrome(let target) = intervention, !closeAttempted,
+              pose == .waking || pose == .running || pose == .reaching else { return }
+        lastTargetCheck = now
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: target.bundleIdentifier).isEmpty else {
+            cancelIntervention(now: now)
+            return
+        }
+        let script = """
+        if application id "\(target.bundleIdentifier)" is not running then return "changed"
+        tell application id "\(target.bundleIdentifier)"
+            \(Self.identityGuard(for: target))
+            return URL of active tab of front window
+        end tell
+        """
+        let generation = browserGeneration
+        browserScanInFlight = true
+        Task { [weak self] in
+            let result = await BrowserScriptRunner.shared.perform { BrowserScriptRunner.execute(script) }
+            guard let self else { return }
+            self.browserScanInFlight = false
+            guard self.isEnabled, generation == self.browserGeneration, !self.closeAttempted,
+                  case .chrome(let current) = self.intervention, current == target,
+                  let result else { return }
+            if Self.distractionLabel(for: result) != target.label {
+                self.cancelIntervention(now: self.clock())
+                self.updateAnimationTimer()
+            }
+        }
+    }
+
     private func cancelIntervention(now: Date) {
+        closeCancellation?.cancel()
         if pose == .waking {
             let settlePhase = max(0, CatLayout.settleDuration - animationPhase)
             resetToSleep()
@@ -675,11 +843,17 @@ final class FocusCatController: ObservableObject {
     /// distraction. Revalidate atomically at close time; never close a replacement tab.
     func closeChromeTab(_ target: ChromeTarget,
                         execute: (String) -> String? = FocusCatController.executeChromeScript) -> Bool {
+        Self.performClose(target, execute: execute)
+    }
+
+    nonisolated private static func performClose(_ target: ChromeTarget,
+                        execute: (String) -> String?) -> Bool {
         let identityGuard = Self.identityGuard(for: target)
         // A page can navigate between the read and close Apple events. Retry a
         // bounded number of times, always checking identity and classification.
         for _ in 0..<3 {
             let read = """
+            if application id "\(target.bundleIdentifier)" is not running then return "changed"
             tell application id "\(target.bundleIdentifier)"
                 \(identityGuard)
                 return URL of active tab of front window
@@ -695,8 +869,9 @@ final class FocusCatController: ObservableObject {
         return false
     }
 
-    static func closeScript(for target: ChromeTarget, expectedURL: String) -> String {
+    nonisolated static func closeScript(for target: ChromeTarget, expectedURL: String) -> String {
         """
+        if application id "\(target.bundleIdentifier)" is not running then return "changed"
         tell application id "\(target.bundleIdentifier)"
             \(identityGuard(for: target))
             considering case
@@ -714,7 +889,7 @@ final class FocusCatController: ObservableObject {
         return error == nil ? result : nil
     }
 
-    private static func distractionLabel(for urlString: String) -> String? {
+    nonisolated private static func distractionLabel(for urlString: String) -> String? {
         guard let url = URL(string: urlString), let host = url.host?.lowercased() else { return nil }
         if (host == "youtube.com" || host.hasSuffix(".youtube.com")),
            (url.path.lowercased() == "/shorts" || url.path.lowercased().hasPrefix("/shorts/")) {
@@ -726,7 +901,7 @@ final class FocusCatController: ObservableObject {
         return nil
     }
 
-    private static let chromeBundleIdentifiers: Set<String> = [
+    nonisolated private static let chromeBundleIdentifiers: Set<String> = [
         "com.google.Chrome",
         "com.google.Chrome.canary"
     ]

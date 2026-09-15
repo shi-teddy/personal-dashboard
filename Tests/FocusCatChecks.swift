@@ -99,8 +99,10 @@ struct FocusCatChecks {
         precondition(WhiteFocusCat.attention(for: .running, phase: 0.7) == 0)
         print("PASS: stable tab identity, navigation retry, changed/safe tab guards, errors, retry limit, Instagram navigation, expression and wake cue")
         controller.start()
+        precondition(!controller.hasMovementTimer && controller.hasIdleTimer)
         precondition(controller.pose == .sleeping)
         controller.previewIntervention()
+        precondition(controller.hasMovementTimer && !controller.hasIdleTimer)
         precondition(controller.pose == .waking)
         var transitions: [String] = ["waking"]
         var prior = controller.pose
@@ -126,6 +128,7 @@ struct FocusCatChecks {
             if controller.pose == .sleeping { completed = true; break }
         }
         precondition(completed && clickTime != nil)
+        precondition(!controller.hasMovementTimer && controller.hasIdleTimer)
         precondition(transitions == ["waking", "running", "reaching", "celebrating", "running", "settling", "sleeping"])
         precondition(controller.facingRight)
         // Manually closing/switching the tab during wake, walk, and reach must
@@ -156,11 +159,64 @@ struct FocusCatChecks {
         // Cancelling a reach must not leave a delayed close or movement behind.
         controller.previewIntervention()
         controller.setEnabled(false)
+        precondition(!controller.hasMovementTimer && !controller.hasIdleTimer)
         for _ in 0..<120 { now = now.addingTimeInterval(1.0/60); controller.movementTick(now: now) }
         precondition(controller.pose == .sleeping && !controller.isEnabled)
         controller.setEnabled(true)
         precondition(controller.pose == .sleeping)
         controller.setEnabled(false)
+        var asyncChecksFinished = false
+        Task { @MainActor in
+            var available = false
+            let monitor = FocusCatController(defaults: defaults, browserAvailable: { available })
+            // Enable without starting automatic monitoring; inject every response.
+            defaults.set(true, forKey: "personal-dashboard.focus-cat-enabled.v1")
+            let enabledMonitor = FocusCatController(defaults: defaults, browserAvailable: { available })
+            await enabledMonitor.scanChrome(provider: { preconditionFailure("Unavailable browser scanned") })
+            precondition(enabledMonitor.browserScanCount == 0)
+            available = true
+            await enabledMonitor.scanChrome(provider: { nil })
+            precondition(enabledMonitor.detectionInterval == 5)
+            await enabledMonitor.scanChrome(provider: { nil })
+            precondition(enabledMonitor.detectionInterval == 10)
+            var resume: CheckedContinuation<FocusCatController.ChromeTarget?, Never>?
+            let pending = Task { @MainActor in
+                await enabledMonitor.scanChrome(provider: { await withCheckedContinuation { resume = $0 } })
+            }
+            while resume == nil { await Task.yield() }
+            await enabledMonitor.scanChrome(provider: { preconditionFailure("Overlapping scan") })
+            precondition(enabledMonitor.browserScanInFlight)
+            enabledMonitor.setEnabled(false)
+            resume?.resume(returning: target)
+            await pending.value
+            precondition(enabledMonitor.pose == .sleeping && !enabledMonitor.browserScanInFlight)
+            await monitor.scanChrome(provider: { preconditionFailure("Disabled browser scanned") })
+            let cancellation = BrowserRequestCancellation()
+            cancellation.cancel()
+            let cancelled = await BrowserScriptRunner.shared.perform { cancellation.isCancelled }
+            precondition(cancelled)
+            let workerResult = await BrowserScriptRunner.shared.perform { BrowserScriptRunner.execute("return \"worker-ok\"") }
+            precondition(workerResult == "worker-ok")
+            async let first = BrowserScriptRunner.shared.perform { () -> (Date, Date) in
+                let start = Date(); Thread.sleep(forTimeInterval: 0.03); return (start, Date())
+            }
+            async let second = BrowserScriptRunner.shared.perform { () -> (Date, Date) in
+                let start = Date(); Thread.sleep(forTimeInterval: 0.03); return (start, Date())
+            }
+            let (a, b) = await (first, second)
+            precondition(a.1 <= b.0 || b.1 <= a.0)
+            // Active-site detection resets the backoff and starts animation immediately.
+            let relevant = FocusCatController(defaults: UserDefaults(suiteName: suite + ".relevant")!, browserAvailable: { true })
+            await relevant.scanChrome(provider: { target })
+            precondition(relevant.pose == .waking && relevant.hasMovementTimer && relevant.detectionInterval == 2.5)
+            relevant.setEnabled(false)
+            UserDefaults.standard.removePersistentDomain(forName: suite + ".relevant")
+            asyncChecksFinished = true
+        }
+        let deadline = Date().addingTimeInterval(10)
+        while !asyncChecksFinished && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        precondition(asyncChecksFinished)
+        print("PASS: idle/active/disabled timer lifecycle, adaptive polling, overlapping scans, stale replies and close cancellation")
         if CommandLine.arguments.contains("--live-close-fixture") {
             // Only the explicitly created, uniquely named blank test tab is eligible.
             // Exercise the same generated close script against actual Chrome IDs.

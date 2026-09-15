@@ -101,7 +101,9 @@ struct ScreenTimeActivitySummary: Identifiable, Equatable {
 
 @MainActor
 final class ScreenTimeTracker: ObservableObject {
-    @Published private(set) var sessions: [ScreenTimeSession] = []
+    @Published private(set) var sessions: [ScreenTimeSession] = [] {
+        didSet { historyDirty = true; invalidateAnalytics() }
+    }
     @Published private(set) var isTracking = false
     @Published private(set) var lastError: String?
 
@@ -116,6 +118,25 @@ final class ScreenTimeTracker: ObservableObject {
     private let activitySampleProvider: (() -> ScreenTimeActivitySample?)?
     private let idleSecondsProvider: () -> TimeInterval
     private var timer: Timer?
+    private var persistenceTimer: Timer?
+    private var terminationObserver: NSObjectProtocol?
+    private var historyDirty = false
+    private var lastPersistenceAt = Date.distantPast
+    private var nextRetentionCheck = Date.distantPast
+    private var sampleGeneration = 0
+    private(set) var sampleInFlight = false
+    var hasSamplingTimer: Bool { timer != nil }
+    private(set) var persistenceWriteCount = 0
+    private(set) var analyticsComputationCount = 0
+    private var cachedCalendar = Calendar.current
+    private var cachedRules: [ActivityClassificationRule] = []
+    private var daySessions: [DateInterval: [ScreenTimeSession]] = [:]
+    private var durationCache: [DateInterval: TimeInterval] = [:]
+    private var chartCache: [DateInterval: [ScreenTimeChartSegment]] = [:]
+    private var scoreCache: [DateInterval: [FocusDriftPoint]] = [:]
+    private var summaryCache: [DateInterval: ScreenTimeProductivitySummary] = [:]
+    private struct ActivityKey: Hashable { let day: DateInterval; let limit: Int }
+    private var activityCache: [ActivityKey: [ScreenTimeActivitySummary]] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
     private var lastSampleAt: Date?
     private var activeSessionID: UUID?
@@ -179,6 +200,8 @@ final class ScreenTimeTracker: ObservableObject {
 
     deinit {
         timer?.invalidate()
+        persistenceTimer?.invalidate()
+        if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
         for observer in workspaceObservers {
             workspace.notificationCenter.removeObserver(observer)
         }
@@ -187,26 +210,34 @@ final class ScreenTimeTracker: ObservableObject {
     private func startTracking() {
         guard !isTracking else { return }
         isTracking = true
-        recordSample(now: nowProvider())
+        Task { await requestSample() }
+        scheduleSamplingTimer()
+    }
+
+    private func scheduleSamplingTimer() {
+        guard timer == nil, suspensionReasons.isEmpty else { return }
         timer = Timer(timeInterval: sampleInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.recordSample(now: self.nowProvider())
+                await self.requestSample()
             }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
+        timer?.tolerance = 0.5
     }
 
     func clearHistory() {
+        sampleGeneration += 1
+        nextRetentionCheck = .distantPast
         sessions.removeAll()
         lastSampleAt = nil
         activeSessionID = nil
-        saveSessions()
-        if isTracking { recordSample(now: nowProvider()) }
+        flushPersistence()
+        if isTracking { Task { await requestSample() } }
     }
 
     func refresh() {
-        if isTracking { recordSample(now: nowProvider()) }
+        if isTracking { Task { await requestSample() } }
         objectWillChange.send()
     }
 
@@ -232,7 +263,11 @@ final class ScreenTimeTracker: ObservableObject {
 
     func duration(for date: Date) -> TimeInterval {
         let interval = trackingInterval(for: date)
-        return sessions.reduce(0) { $0 + overlap(of: $1, with: interval) }
+        prepareAnalytics()
+        if let cached = durationCache[interval] { return cached }
+        let result = sessions(in: interval).reduce(0) { $0 + overlap(of: $1, with: interval) }
+        durationCache[interval] = result
+        return result
     }
 
     func formattedDuration(for date: Date) -> String {
@@ -244,6 +279,10 @@ final class ScreenTimeTracker: ObservableObject {
         classificationRules: [ActivityClassificationRule]
     ) -> [ScreenTimeChartSegment] {
         let interval = trackingInterval(for: date)
+        prepareAnalytics(rules: classificationRules)
+        if let cached = chartCache[interval] { return cached }
+        analyticsComputationCount += 1
+        let relevantSessions = sessions(in: interval)
         var segments: [ScreenTimeChartSegment] = []
         let bucketMinutes = 5
         let bucketCount = 60 / bucketMinutes
@@ -263,7 +302,7 @@ final class ScreenTimeTracker: ObservableObject {
                 count: bucketCount
             )
 
-            for session in sessions {
+            for session in relevantSessions {
                 let segmentStart = max(session.startedAt, hour.start)
                 let segmentEnd = min(session.endedAt, hour.end)
                 guard segmentEnd > segmentStart else { continue }
@@ -378,6 +417,7 @@ final class ScreenTimeTracker: ObservableObject {
                 firstBucket = endBucket + 1
             }
         }
+        chartCache[interval] = segments
         return segments
     }
 
@@ -385,12 +425,18 @@ final class ScreenTimeTracker: ObservableObject {
         for date: Date,
         classificationRules: [ActivityClassificationRule]
     ) -> ScreenTimeProductivitySummary {
+        prepareAnalytics(rules: classificationRules)
+        let day = trackingInterval(for: date)
+        if let cached = summaryCache[day] { return cached }
+        analyticsComputationCount += 1
         let durations = classificationDurations(for: date, rules: classificationRules)
-        return ScreenTimeProductivitySummary(
+        let result = ScreenTimeProductivitySummary(
             focusDuration: durations[.flow, default: 0],
             neutralDuration: durations[.neutral, default: 0],
             driftDuration: durations[.brainrot, default: 0]
         )
+        summaryCache[day] = result
+        return result
     }
 
     func focusDriftPoints(
@@ -398,8 +444,14 @@ final class ScreenTimeTracker: ObservableObject {
         classificationRules: [ActivityClassificationRule]
     ) -> [FocusDriftPoint] {
         let day = trackingInterval(for: date)
-        let relevantSessions = sessions.filter { overlap(of: $0, with: day) > 0 }
-        guard let latestEnd = relevantSessions.map({ min($0.endedAt, day.end) }).max() else { return [] }
+        prepareAnalytics(rules: classificationRules)
+        if let cached = scoreCache[day] { return cached }
+        analyticsComputationCount += 1
+        let relevantSessions = sessions(in: day)
+        guard let latestEnd = relevantSessions.map({ min($0.endedAt, day.end) }).max() else {
+            scoreCache[day] = []
+            return []
+        }
 
         let windowDuration: TimeInterval = 30 * 60
         let lastWindow = min(47, max(0, Int(latestEnd.timeIntervalSince(day.start) / windowDuration)))
@@ -439,6 +491,7 @@ final class ScreenTimeTracker: ObservableObject {
                 driftScore: driftScore
             ))
         }
+        scoreCache[day] = points
         return points
     }
 
@@ -448,12 +501,16 @@ final class ScreenTimeTracker: ObservableObject {
         limit: Int = 3
     ) -> [ScreenTimeActivitySummary] {
         let day = trackingInterval(for: date)
+        prepareAnalytics(rules: classificationRules)
+        let key = ActivityKey(day: day, limit: max(0, limit))
+        if let cached = activityCache[key] { return cached }
+        analyticsComputationCount += 1
         var durations: [String: TimeInterval] = [:]
         var counts: [String: Int] = [:]
         var sources: [String: TrackedActivitySource] = [:]
         var classifications: [String: ProductivityClassification] = [:]
 
-        for session in sessions {
+        for session in sessions(in: day) {
             let duration = overlap(of: session, with: day)
             guard duration > 0 else { continue }
             let source = source(for: session)
@@ -463,7 +520,7 @@ final class ScreenTimeTracker: ObservableObject {
             classifications[source.id] = classification(for: session, rules: classificationRules)
         }
 
-        return durations
+        let result: [ScreenTimeActivitySummary] = durations
             .sorted { lhs, rhs in
                 lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value
             }
@@ -479,6 +536,39 @@ final class ScreenTimeTracker: ObservableObject {
                     sessionCount: counts[id, default: 0]
                 )
             }
+        activityCache[key] = result
+        return result
+    }
+
+    private func invalidateAnalytics() {
+        daySessions.removeAll(keepingCapacity: true)
+        durationCache.removeAll(keepingCapacity: true)
+        chartCache.removeAll(keepingCapacity: true)
+        scoreCache.removeAll(keepingCapacity: true)
+        summaryCache.removeAll(keepingCapacity: true)
+        activityCache.removeAll(keepingCapacity: true)
+    }
+
+    private func prepareAnalytics(rules: [ActivityClassificationRule]? = nil) {
+        let calendar = Calendar.current
+        if calendar != cachedCalendar || daySessions.count > 90 || activityCache.count > 180 {
+            invalidateAnalytics()
+            cachedCalendar = calendar
+        }
+        if let rules, rules != cachedRules {
+            cachedRules = rules
+            chartCache.removeAll(keepingCapacity: true)
+            scoreCache.removeAll(keepingCapacity: true)
+            summaryCache.removeAll(keepingCapacity: true)
+            activityCache.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func sessions(in day: DateInterval) -> [ScreenTimeSession] {
+        if let cached = daySessions[day] { return cached }
+        let result = sessions.filter { overlap(of: $0, with: day) > 0 }
+        daySessions[day] = result
+        return result
     }
 
     func trackingDay(containing moment: Date) -> Date {
@@ -548,7 +638,7 @@ final class ScreenTimeTracker: ObservableObject {
     ) -> [ProductivityClassification: TimeInterval] {
         let day = trackingInterval(for: date)
         var durations: [ProductivityClassification: TimeInterval] = [:]
-        for session in sessions {
+        for session in sessions(in: day) {
             let duration = overlap(of: session, with: day)
             guard duration > 0 else { continue }
             durations[classification(for: session, rules: rules), default: 0] += duration
@@ -605,18 +695,52 @@ final class ScreenTimeTracker: ObservableObject {
     }
 
     func recordSample(now: Date) {
-        guard suspensionReasons.isEmpty else { return }
+        guard suspensionReasons.isEmpty, !sampleInFlight else { return }
+        sampleInFlight = true
+        defer { sampleInFlight = false }
+        applySample(now: now, identity: currentActivity())
+    }
+
+    /// At most one in-flight sample; the worker never owns mutable tracker state.
+    /// Discard answers captured before a lock, clear, or foreground-app change.
+    func requestSample(provider: (() async -> ScreenTimeActivitySample?)? = nil) async {
+        guard suspensionReasons.isEmpty, !sampleInFlight else { return }
+        sampleInFlight = true
+        defer { sampleInFlight = false }
+        let generation = sampleGeneration
+        let now = nowProvider()
+        let identity: ScreenTimeActivitySample?
+        if let provider { identity = await provider() }
+        else if let activitySampleProvider { identity = activitySampleProvider() }
+        else if let foreground = currentActivity(readWebsite: false) {
+            if !Self.browserIdentifiers.contains(foreground.bundleIdentifier) {
+                applySample(now: now, identity: foreground)
+                return
+            }
+            let pid = workspace.frontmostApplication?.processIdentifier
+            let domain = await BrowserScriptRunner.shared.perform {
+                Self.activeWebsiteDomain(for: foreground.bundleIdentifier)
+            }
+            guard workspace.frontmostApplication?.processIdentifier == pid else { return }
+            identity = ScreenTimeActivitySample(appName: foreground.appName,
+                bundleIdentifier: foreground.bundleIdentifier, websiteDomain: domain)
+        } else { identity = nil }
+        guard generation == sampleGeneration, suspensionReasons.isEmpty else { return }
+        applySample(now: now, identity: idleSecondsProvider() < idleThreshold ? identity : nil)
+    }
+
+    private func applySample(now: Date, identity: ScreenTimeActivitySample?) {
         removeExpiredSessions(now: now)
         if let previous = lastSampleAt, now.timeIntervalSince(previous) > sampleInterval * 3 {
             finishCurrentSession(at: previous.addingTimeInterval(sampleInterval))
             activeSessionID = nil
         }
 
-        guard let identity = currentActivity() else {
+        guard let identity else {
             finishCurrentSession(at: now)
             activeSessionID = nil
             lastSampleAt = now
-            saveSessions()
+            flushPersistence()
             return
         }
 
@@ -626,7 +750,7 @@ final class ScreenTimeTracker: ObservableObject {
            last.bundleIdentifier == identity.bundleIdentifier,
            last.websiteDomain == identity.websiteDomain,
            now.timeIntervalSince(last.endedAt) <= sampleInterval * 3 {
-            sessions[sessions.count - 1].endedAt = now
+            if now > last.endedAt { sessions[sessions.count - 1].endedAt = now }
         } else {
             finishCurrentSession(at: now)
             let session = ScreenTimeSession(
@@ -640,7 +764,7 @@ final class ScreenTimeTracker: ObservableObject {
             activeSessionID = session.id
         }
         lastSampleAt = now
-        saveSessions()
+        saveSessions(now: now)
     }
 
     private func finishCurrentSession(at date: Date) {
@@ -648,24 +772,44 @@ final class ScreenTimeTracker: ObservableObject {
               let index = sessions.firstIndex(where: { $0.id == activeSessionID }) else { return }
         let sampledBoundary = lastSampleAt?.addingTimeInterval(sampleInterval) ?? date
         let boundedEnd = min(date, sampledBoundary)
-        sessions[index].endedAt = max(sessions[index].endedAt, boundedEnd)
+        if boundedEnd > sessions[index].endedAt { sessions[index].endedAt = boundedEnd }
     }
 
     func suspendTracking(for reason: SuspensionReason, now: Date) {
+        sampleGeneration += 1
+        timer?.invalidate()
+        timer = nil
         finishCurrentSession(at: now)
         suspensionReasons.insert(reason)
         activeSessionID = nil
         lastSampleAt = nil
-        saveSessions()
+        flushPersistence()
     }
 
     func resumeTracking(from reason: SuspensionReason, now: Date) {
         suspensionReasons.remove(reason)
         guard suspensionReasons.isEmpty else { return }
-        recordSample(now: now)
+        if isTracking {
+            scheduleSamplingTimer()
+            Task { await requestSample() }
+        }
+        else { recordSample(now: now) }
+    }
+
+    func prepareForTermination() {
+        sampleGeneration += 1
+        timer?.invalidate()
+        timer = nil
+        finishCurrentSession(at: nowProvider())
+        flushPersistence()
     }
 
     private func installLifecycleObservers() {
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.prepareForTermination() }
+        }
         let center = workspace.notificationCenter
         let suspensions: [(Notification.Name, SuspensionReason)] = [
             (NSWorkspace.willSleepNotification, .systemSleep),
@@ -675,7 +819,7 @@ final class ScreenTimeTracker: ObservableObject {
         for (name, reason) in suspensions {
             workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) {
                 [weak self] _ in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     guard let self else { return }
                     self.suspendTracking(for: reason, now: self.nowProvider())
                 }
@@ -689,7 +833,7 @@ final class ScreenTimeTracker: ObservableObject {
         for (name, reason) in resumptions {
             workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) {
                 [weak self] _ in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     guard let self else { return }
                     self.resumeTracking(from: reason, now: self.nowProvider())
                 }
@@ -697,7 +841,7 @@ final class ScreenTimeTracker: ObservableObject {
         }
     }
 
-    private func currentActivity() -> ScreenTimeActivitySample? {
+    private func currentActivity(readWebsite: Bool = true) -> ScreenTimeActivitySample? {
         // Passive reading and video playback remain activity for five minutes; after
         // that, the tracker waits for fresh input instead of manufacturing idle time.
         guard idleSecondsProvider() < idleThreshold else { return nil }
@@ -710,11 +854,11 @@ final class ScreenTimeTracker: ObservableObject {
         return ScreenTimeActivitySample(
             appName: appName,
             bundleIdentifier: bundleIdentifier,
-            websiteDomain: activeWebsiteDomain(for: bundleIdentifier)
+            websiteDomain: readWebsite ? Self.activeWebsiteDomain(for: bundleIdentifier) : nil
         )
     }
 
-    private func activeWebsiteDomain(for bundleIdentifier: String) -> String? {
+    nonisolated private static func activeWebsiteDomain(for bundleIdentifier: String) -> String? {
         let script: String
         switch bundleIdentifier {
         case "com.apple.Safari", "com.apple.SafariTechnologyPreview":
@@ -737,9 +881,8 @@ final class ScreenTimeTracker: ObservableObject {
             return nil
         }
 
-        var error: NSDictionary?
-        guard let value = NSAppleScript(source: script)?.executeAndReturnError(&error).stringValue,
-              error == nil,
+        let runningGuard = "if application id \"\(bundleIdentifier)\" is not running then return \"\"\n"
+        guard let value = BrowserScriptRunner.execute(runningGuard + script),
               let components = URLComponents(string: value),
               var host = components.host?.lowercased(),
               !host.isEmpty else { return nil }
@@ -787,18 +930,40 @@ final class ScreenTimeTracker: ObservableObject {
                 Self.ignoredBundleIdentifiers.contains(session.bundleIdentifier)
                     || Self.ignoredApplicationNames.contains(session.appName)
             }
-            if sessions.count != originalCount { saveSessions() }
+            if sessions.count != originalCount { flushPersistence() }
+            else { historyDirty = false }
         } catch {
             lastError = "The saved screen-time history could not be read."
         }
     }
 
-    private func saveSessions() {
+    private func saveSessions(now: Date? = nil) {
+        guard historyDirty else { return }
+        let now = now ?? nowProvider()
+        if now.timeIntervalSince(lastPersistenceAt) >= 30 {
+            flushPersistence(now: now)
+        } else if persistenceTimer == nil {
+            let timer = Timer(timeInterval: max(0.01, 30 - now.timeIntervalSince(lastPersistenceAt)), repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.flushPersistence() }
+            }
+            timer.tolerance = 1
+            RunLoop.main.add(timer, forMode: .common)
+            persistenceTimer = timer
+        }
+    }
+
+    func flushPersistence(now: Date? = nil) {
+        persistenceTimer?.invalidate()
+        persistenceTimer = nil
+        guard historyDirty else { return }
         do {
             let folder = storageURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let data = try encoder.encode(sessions)
             try data.write(to: storageURL, options: .atomic)
+            historyDirty = false
+            lastPersistenceAt = now ?? nowProvider()
+            persistenceWriteCount += 1
             lastError = nil
         } catch {
             lastError = "Screen-time history could not be saved."
@@ -817,9 +982,23 @@ final class ScreenTimeTracker: ObservableObject {
     }
 
     private func removeExpiredSessions(now: Date = Date()) {
+        guard now >= nextRetentionCheck else { return }
         let cutoff = now.addingTimeInterval(-retentionInterval)
         let originalCount = sessions.count
-        sessions.removeAll { $0.endedAt < cutoff }
+        // Avoid a no-op array mutation, publication and cache invalidation on
+        // every five-second sample while still enforcing the exact cutoff.
+        if sessions.contains(where: { $0.endedAt < cutoff }) {
+            sessions.removeAll { $0.endedAt < cutoff }
+        }
         if sessions.count != originalCount { saveSessions() }
+        nextRetentionCheck = sessions.map(\.endedAt).min()?.addingTimeInterval(retentionInterval)
+            ?? now.addingTimeInterval(retentionInterval)
     }
+
+    nonisolated private static let browserIdentifiers: Set<String> = [
+        "com.apple.Safari", "com.apple.SafariTechnologyPreview",
+        "com.google.Chrome", "com.google.Chrome.canary",
+        "com.microsoft.edgemac", "com.microsoft.edgemac.Dev",
+        "com.brave.Browser", "com.brave.Browser.beta"
+    ]
 }

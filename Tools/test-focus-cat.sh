@@ -11,7 +11,7 @@ xcodebuild -project PersonalDashboard.xcodeproj -scheme PersonalDashboard -confi
 check_app="$check_root/ApprovedCatChecks.app/Contents"
 mkdir -p "$check_app/MacOS" "$check_app/Resources"
 cp "$check_root/build/Build/Products/Release/PersonalDashboard.app/Contents/Resources/ApprovedCatAnimation.json" "$check_app/Resources/"
-xcrun swiftc -module-cache-path "$check_root/modules" \
+xcrun swiftc PersonalDashboard/BrowserScriptRunner.swift -module-cache-path "$check_root/modules" \
     PersonalDashboard/FocusCatArtwork.swift PersonalDashboard/FocusCatView.swift \
     PersonalDashboard/FocusCatController.swift Tests/FocusCatChecks.swift \
     -o "$check_app/MacOS/ApprovedCatChecks"

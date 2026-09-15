@@ -54,7 +54,7 @@ struct TodoChecks {
 
         precondition(subject.todos.map(\.title) == ["Second", "Third", "First"])
         precondition(subject.todos.map(\.isCompleted) == [false, false, true])
-        precondition(subject.todoDividerIndex == 0)
+        precondition(subject.todoDividerIndex == 1)
 
         subject.toggleTodo(firstID)
         precondition(subject.todos.map(\.title) == ["Second", "Third", "First"])
@@ -68,9 +68,10 @@ struct TodoChecks {
         precondition(subject.todos.map(\.title) == ["Third"])
 
         subject.addTodo(title: "Fourth")
-        precondition(subject.todoDividerIndex == 2)
-        subject.deleteTodo(subject.todos[0].id)
         precondition(subject.todoDividerIndex == 1)
+        precondition(subject.todos.map(\.title) == ["Third", "Fourth"])
+        subject.deleteTodo(subject.todos[0].id)
+        precondition(subject.todoDividerIndex == 0)
         precondition(subject.todos.map(\.title) == ["Fourth"])
     }
 
@@ -118,13 +119,13 @@ struct TodoChecks {
         subject = nil
 
         let restored = store(defaults: defaults, now: { now.addingTimeInterval(60) })
-        precondition(restored.todos.map(\.title) == ["Keep active", "Keep completed"])
+        precondition(restored.todos.map(\.title) == ["Keep completed", "Keep active"])
         precondition(restored.todos.map(\.isCompleted) == [false, true])
         precondition(restored.todoDividerIndex == 1)
 
         restored.addTodo(title: "New active")
-        precondition(restored.todos.map(\.title) == ["Keep active", "New active", "Keep completed"])
-        precondition(restored.todoDividerIndex == 2)
+        precondition(restored.todos.map(\.title) == ["Keep completed", "New active", "Keep active"])
+        precondition(restored.todoDividerIndex == 1)
     }
 
     private static func checkCompletionInsights() throws {

@@ -29,7 +29,7 @@ final class ApprovedCatArtwork {
         let pawY: Double
         let distancePerLoop: Double
         let closeTime: Double
-        let clips: [String: ClipData]
+        var clips: [String: ClipData]
     }
     struct Frame {
         let body: CGPath
@@ -102,7 +102,11 @@ final class ApprovedCatArtwork {
             }
             clips[name] = Clip(duration: data.duration, loop: data.loop, frames: frames)
         }
-        self.manifest = manifest
+        // Drawing paths own the compiled geometry. Release the decoded coordinate
+        // arrays rather than retaining a second copy for the app's lifetime.
+        var metadata = manifest
+        metadata.clips = [:]
+        self.manifest = metadata
         self.clips = clips
         self.bounds = bounds.union(CGRect(x: 116, y: -22, width: 9, height: 21))
     }
@@ -140,6 +144,10 @@ final class ApprovedCatArtwork {
                 components: [red/255, green/255, blue/255, 1])!
     }
 
+    private static let cream = color(227, 224, 211)
+    private static let ink = color(22, 22, 20)
+    private static let attentionRed = color(231, 65, 67)
+
     /// Draw in top-left coordinates, exactly as in the approved animation.
     func draw(_ frame: Frame, in context: CGContext, size: CGSize, facingRight: Bool, attention: Double = 0) {
         let scale = min(size.width / manifest.canvasWidth, size.height / manifest.canvasHeight)
@@ -153,7 +161,7 @@ final class ApprovedCatArtwork {
             context.translateBy(x: 144, y: 0)
             context.scaleBy(x: -1, y: 1)
         }
-        let cream = Self.color(227, 224, 211)
+        let cream = Self.cream
         context.setFillColor(cream)
         context.addPath(frame.body)
         context.fillPath()
@@ -172,11 +180,11 @@ final class ApprovedCatArtwork {
             context.addPath(tail)
             context.strokePath()
         }
-        context.setFillColor(Self.color(22, 22, 20))
+        context.setFillColor(Self.ink)
         for path in frame.face { context.addPath(path); context.fillPath() }
         if attention > 0 {
             context.setAlpha(attention)
-            let red = Self.color(231, 65, 67)
+            let red = Self.attentionRed
             let headTop = frame.body.boundingBoxOfPath.minY
             let markX = frame.face[1].boundingBoxOfPath.midX - 2
             context.setStrokeColor(red)
