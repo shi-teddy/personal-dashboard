@@ -55,15 +55,15 @@ struct ScreenTimeProductivitySummary: Equatable {
     let driftDuration: TimeInterval
 
     var totalDuration: TimeInterval { focusDuration + neutralDuration + driftDuration }
+    var scoredDuration: TimeInterval { focusDuration + driftDuration }
 
     var score: Int {
-        guard totalDuration > 0 else { return 0 }
-        let weightedDuration = focusDuration + (neutralDuration * 0.5)
-        return Int((weightedDuration / totalDuration * 100).rounded())
+        guard scoredDuration > 0 else { return 0 }
+        return Int((focusDuration / scoredDuration * 100).rounded())
     }
 
     var grade: String {
-        guard totalDuration > 0 else { return "—" }
+        guard scoredDuration > 0 else { return "—" }
         return switch score {
         case 97...: "A+"
         case 93...: "A"
@@ -311,7 +311,7 @@ final class ScreenTimeTracker: ObservableObject {
                 let endMinute = segmentEnd.timeIntervalSince(hour.start) / 60
                 let firstBucket = max(0, min(bucketCount - 1, Int(startMinute / Double(bucketMinutes))))
                 let lastBucket = max(0, min(bucketCount - 1, Int(endMinute.nextDown / Double(bucketMinutes))))
-                let activityName = session.websiteDomain ?? session.appName
+                let activityName = source(for: session).displayName
                 let classification = classification(for: session, rules: classificationRules)
 
                 for bucket in firstBucket...lastBucket {
@@ -606,20 +606,7 @@ final class ScreenTimeTracker: ObservableObject {
         for session in sessions.reversed() {
             guard session.endedAt > currentTrackingDay.start,
                   session.startedAt < currentTrackingDay.end else { continue }
-            let source: TrackedActivitySource
-            if let domain = session.websiteDomain, !domain.isEmpty {
-                source = TrackedActivitySource(
-                    displayName: domain,
-                    identifier: domain,
-                    kind: .website
-                )
-            } else {
-                source = TrackedActivitySource(
-                    displayName: session.appName,
-                    identifier: session.bundleIdentifier,
-                    kind: .application
-                )
-            }
+            let source = source(for: session)
             if let clearedAt = clearedSourceCutoffs[source.id], session.endedAt <= clearedAt {
                 continue
             }
@@ -647,7 +634,7 @@ final class ScreenTimeTracker: ObservableObject {
     }
 
     private func source(for session: ScreenTimeSession) -> TrackedActivitySource {
-        if let domain = session.websiteDomain, !domain.isEmpty {
+        if let domain = Self.displayableWebsiteDomain(session.websiteDomain) {
             return TrackedActivitySource(displayName: domain, identifier: domain, kind: .website)
         }
         return TrackedActivitySource(
@@ -884,10 +871,21 @@ final class ScreenTimeTracker: ObservableObject {
         let runningGuard = "if application id \"\(bundleIdentifier)\" is not running then return \"\"\n"
         guard let value = BrowserScriptRunner.execute(runningGuard + script),
               let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
               var host = components.host?.lowercased(),
               !host.isEmpty else { return nil }
         if host.hasPrefix("www.") { host.removeFirst(4) }
         return host
+    }
+
+    /// Older builds stored the host component of browser-owned pages such as
+    /// chrome://newtab as though it were a website. Keep the history format intact,
+    /// but attribute those sessions to the browser application in analytics.
+    nonisolated private static func displayableWebsiteDomain(_ domain: String?) -> String? {
+        guard let domain, !domain.isEmpty,
+              !internalBrowserHosts.contains(domain.lowercased()) else { return nil }
+        return domain
     }
 
     private func overlap(of session: ScreenTimeSession, with interval: DateInterval) -> TimeInterval {
@@ -1000,5 +998,10 @@ final class ScreenTimeTracker: ObservableObject {
         "com.google.Chrome", "com.google.Chrome.canary",
         "com.microsoft.edgemac", "com.microsoft.edgemac.Dev",
         "com.brave.Browser", "com.brave.Browser.beta"
+    ]
+
+    nonisolated private static let internalBrowserHosts: Set<String> = [
+        "newtab", "new-tab-page", "contextual-tasks", "history",
+        "downloads", "bookmarks", "extensions", "settings"
     ]
 }

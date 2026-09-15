@@ -15,8 +15,10 @@ struct TrackingChecks {
         try checkTrackingDaySourceExpiry(in: root, defaults: defaults)
         try checkChronologicalFocusDrift(in: root, defaults: defaults)
         try checkStableChartTie(in: root, defaults: defaults)
+        try checkTopActivityAggregation(in: root, defaults: defaults)
         try checkUnsampledTimeIsNotRecorded(in: root, defaults: defaults)
         try checkBatchingAndCaches(in: root, defaults: defaults)
+        checkNeutralIsExcludedFromProductivityScore()
         checkOverlappingSamples(in: root, defaults: defaults)
         print("Tracking regression checks passed.")
     }
@@ -35,12 +37,13 @@ struct TrackingChecks {
         _ name: String,
         _ identifier: String,
         _ start: String,
-        _ end: String
+        _ end: String,
+        websiteDomain: String? = nil
     ) -> ScreenTimeSession {
         ScreenTimeSession(
             appName: name,
             bundleIdentifier: identifier,
-            websiteDomain: nil,
+            websiteDomain: websiteDomain,
             startedAt: date(start),
             endedAt: date(end)
         )
@@ -131,6 +134,45 @@ struct TrackingChecks {
             ]
         )
         precondition(segments.count == 1 && segments[0].classification == .flow)
+    }
+
+    private static func checkTopActivityAggregation(in root: URL, defaults: UserDefaults) throws {
+        let storage = root.appendingPathComponent("top-activities.json")
+        try write([
+            session("Work", "test.work", "2026-09-11T03:50:00-04:00", "2026-09-11T04:10:00-04:00"),
+            session("Work", "test.work", "2026-09-11T05:00:00-04:00", "2026-09-11T05:30:00-04:00"),
+            session("Chrome", "com.google.Chrome", "2026-09-11T06:00:00-04:00", "2026-09-11T06:20:00-04:00", websiteDomain: "example.com"),
+            session("Safari", "com.apple.Safari", "2026-09-11T07:00:00-04:00", "2026-09-11T07:10:00-04:00", websiteDomain: "example.com"),
+            session("Chrome", "com.google.Chrome", "2026-09-11T08:00:00-04:00", "2026-09-11T08:08:00-04:00", websiteDomain: "newtab"),
+            session("Messages", "test.messages", "2026-09-12T03:50:00-04:00", "2026-09-12T04:10:00-04:00")
+        ], to: storage)
+        let subject = tracker(
+            storageURL: storage,
+            now: { date("2026-09-12T04:30:00-04:00") },
+            defaults: defaults
+        )
+        let rules = [
+            rule("Work", "test.work", .flow),
+            rule("Example", "example.com", .brainrot, kind: .website)
+        ]
+        let day = date("2026-09-11T12:00:00-04:00")
+        let activities = subject.topActivities(for: day, classificationRules: rules, limit: 10)
+
+        precondition(activities.count == 4)
+        precondition(activities[0].id == "application:test.work")
+        precondition(activities[0].duration == 40 * 60 && activities[0].sessionCount == 2)
+        precondition(activities[0].classification == .flow)
+        precondition(activities[1].id == "website:example.com")
+        precondition(activities[1].duration == 30 * 60 && activities[1].sessionCount == 2)
+        precondition(activities[1].classification == .brainrot)
+        precondition(activities[2].duration == 10 * 60 && activities[2].sessionCount == 1)
+        precondition(activities[3].id == "application:com.google.chrome")
+        precondition(activities[3].name == "Chrome" && activities[3].kind == .application)
+        precondition(activities[3].duration == 8 * 60 && activities[3].sessionCount == 1)
+        precondition(activities.reduce(0) { $0 + $1.duration } == subject.duration(for: day))
+        precondition(subject.topActivities(for: day, classificationRules: rules, limit: 2) == Array(activities.prefix(2)))
+        precondition(subject.shortDuration(activities[0].duration) == "40m")
+        print("PASS: top apps/sites aggregate, group, clip, sort, limit, and display exact durations")
     }
 
     private static func checkUnsampledTimeIsNotRecorded(in root: URL, defaults: UserDefaults) throws {
@@ -226,6 +268,25 @@ struct TrackingChecks {
         print("PASS: batching, explicit flush, unchanged-write suppression, session/rule/clear cache invalidation")
     }
 
+    private static func checkNeutralIsExcludedFromProductivityScore() {
+        let summary = ScreenTimeProductivitySummary(
+            focusDuration: 4 * 60 * 60,
+            neutralDuration: 10 * 60 * 60,
+            driftDuration: 60 * 60
+        )
+        precondition(summary.totalDuration == 15 * 60 * 60)
+        precondition(summary.scoredDuration == 5 * 60 * 60)
+        precondition(summary.score == 80 && summary.grade == "B−")
+
+        let neutralOnly = ScreenTimeProductivitySummary(
+            focusDuration: 0,
+            neutralDuration: 10 * 60 * 60,
+            driftDuration: 0
+        )
+        precondition(neutralOnly.score == 0 && neutralOnly.grade == "—")
+        print("PASS: Neutral time is excluded from productivity score and grade eligibility")
+    }
+
     private static func checkOverlappingSamples(in root: URL, defaults: UserDefaults) {
         let now = date("2026-09-11T12:00:00-04:00")
         let subject = tracker(storageURL: root.appendingPathComponent("overlap.json"), now: { now }, defaults: defaults)
@@ -252,12 +313,13 @@ struct TrackingChecks {
     private static func rule(
         _ name: String,
         _ identifier: String,
-        _ classification: ProductivityClassification
+        _ classification: ProductivityClassification,
+        kind: ActivitySourceKind = .application
     ) -> ActivityClassificationRule {
         ActivityClassificationRule(
             displayName: name,
             identifier: identifier,
-            kind: .application,
+            kind: kind,
             classification: classification,
             subgroupID: UUID()
         )

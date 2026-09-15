@@ -535,9 +535,9 @@ private struct ProductivityCard: View {
             }
             Spacer(minLength: 4)
             VStack(alignment: .leading, spacing: 7) {
-                Text(summary.totalDuration > 0 ? "\(summary.grade) grade" : "No grade yet")
+                Text(summary.scoredDuration > 0 ? "\(summary.grade) grade" : "No grade yet")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(summary.totalDuration > 0 ? Palette.focus : Palette.muted)
+                    .foregroundStyle(summary.scoredDuration > 0 ? Palette.focus : Palette.muted)
                 Text(productivityMessage(summary))
                     .font(.system(size: 10))
                     .foregroundStyle(Palette.muted)
@@ -551,7 +551,9 @@ private struct ProductivityCard: View {
     }
 
     private func productivityMessage(_ summary: ScreenTimeProductivitySummary) -> String {
-        guard summary.totalDuration > 0 else { return "Classify activity in Settings to calculate your score." }
+        guard summary.scoredDuration > 0 else {
+            return "Focus or Drift activity will calculate your score."
+        }
         switch summary.score {
         case 90...: return "Excellent focus day"
         case 80...: return "Strong focus day"
@@ -750,13 +752,13 @@ private struct InsightsPage: View {
     }
 
     private var averageScore: Int {
-        let activeDays = days.filter { $0.productivity.totalDuration > 0 }
+        let activeDays = days.filter { $0.productivity.scoredDuration > 0 }
         guard !activeDays.isEmpty else { return 0 }
         return activeDays.reduce(0) { $0 + $1.productivity.score } / activeDays.count
     }
 
     private var bestDay: InsightDaySummary? {
-        days.filter { $0.productivity.totalDuration > 0 }
+        days.filter { $0.productivity.scoredDuration > 0 }
             .max { $0.productivity.score < $1.productivity.score }
     }
 
