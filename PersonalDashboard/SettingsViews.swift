@@ -175,24 +175,84 @@ struct ClassificationSettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             if deepFocus.isActive {
-                Button("End Deep Focus") { deepFocus.endSession() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                Button { deepFocus.endSession() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 8, weight: .bold))
+                        Text("End session")
+                    }
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Palette.warning)
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
+                    .background(Palette.warning.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Palette.warning.opacity(0.35), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .trailing)
             } else {
                 HStack(spacing: 8) {
-                    Picker("Duration", selection: $deepFocus.selectedDuration) {
+                    Menu {
                         ForEach(DeepFocusDuration.allCases) { duration in
-                            Text(duration.displayName).tag(duration)
+                            Button {
+                                deepFocus.selectedDuration = duration
+                            } label: {
+                                if duration == deepFocus.selectedDuration {
+                                    Label(duration.displayName, systemImage: "checkmark")
+                                } else {
+                                    Text(duration.displayName)
+                                }
+                            }
                         }
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "clock")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Palette.focus)
+                            Text(deepFocus.selectedDuration.displayName)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(Palette.muted)
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .background(Palette.track.opacity(0.48))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Palette.border, lineWidth: 1)
+                        )
                     }
-                    .labelsHidden()
-                    .controlSize(.small)
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
                     .frame(maxWidth: .infinity)
 
-                    Button("Start") { deepFocus.beginSelectedSession() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                    Button { deepFocus.beginSelectedSession() } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 8, weight: .bold))
+                            Text("Start")
+                        }
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Palette.ink)
+                        .padding(.horizontal, 11)
+                        .frame(height: 30)
+                        .background(Palette.selected)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Palette.focus.opacity(0.42), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
