@@ -8,6 +8,7 @@ if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]
 fi
 cd "$project_root"
 xcrun swiftc -module-cache-path "$check_root/modules" \
-    PersonalDashboard/Models.swift PersonalDashboard/DashboardStore.swift Tests/TodoChecks.swift \
+    PersonalDashboard/Models.swift PersonalDashboard/CalendarNotificationScheduler.swift \
+    PersonalDashboard/DashboardStore.swift Tests/TodoChecks.swift \
     -o "$check_root/TodoChecks"
 "$check_root/TodoChecks"

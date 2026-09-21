@@ -24,7 +24,14 @@ final class DashboardStore: ObservableObject {
     }
     @Published private(set) var goalCelebration: CompletedGoalRecord?
     @Published private(set) var calendarEvents: [CalendarEvent] = [] {
-        didSet { save(calendarEvents, key: calendarKey) }
+        didSet {
+            save(calendarEvents, key: calendarKey)
+            guard calendarNotificationsReady else { return }
+            calendarNotificationScheduler.synchronize(
+                events: calendarEvents,
+                requestAuthorizationIfNeeded: true
+            )
+        }
     }
     @Published private(set) var stickyNotes: [StickyNote] = [] {
         didSet { save(stickyNotes, key: stickyNotesKey) }
@@ -48,6 +55,8 @@ final class DashboardStore: ObservableObject {
     private let defaults: UserDefaults
     private let nowProvider: () -> Date
     private let automaticallySchedulesTodoCleanup: Bool
+    private let calendarNotificationScheduler: CalendarNotificationScheduling
+    private var calendarNotificationsReady = false
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var todoCleanupTimer: Timer?
@@ -55,11 +64,14 @@ final class DashboardStore: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         nowProvider: @escaping () -> Date = Date.init,
-        automaticallySchedulesTodoCleanup: Bool = true
+        automaticallySchedulesTodoCleanup: Bool = true,
+        calendarNotificationScheduler: CalendarNotificationScheduling? = nil
     ) {
         self.defaults = defaults
         self.nowProvider = nowProvider
         self.automaticallySchedulesTodoCleanup = automaticallySchedulesTodoCleanup
+        self.calendarNotificationScheduler = calendarNotificationScheduler
+            ?? CalendarNotificationScheduler.shared
         todos = load([TodoItem].self, key: todoKey) ?? Self.sampleTodos
         goals = load([GoalItem].self, key: goalKey) ?? Self.sampleGoals
         completedGoals = load([CompletedGoalRecord].self, key: completedGoalsKey) ?? []
@@ -82,9 +94,17 @@ final class DashboardStore: ObservableObject {
         }
         removeCompletedTodosAtDailyCutoff()
         scheduleTodoCleanup()
+        calendarNotificationsReady = true
     }
 
     deinit { todoCleanupTimer?.invalidate() }
+
+    func activateCalendarNotifications() {
+        calendarNotificationScheduler.synchronize(
+            events: calendarEvents,
+            requestAuthorizationIfNeeded: true
+        )
+    }
 
     func addTodo(title: String) {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -282,14 +302,16 @@ final class DashboardStore: ObservableObject {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         let safeEnd = max(endAt, startAt.addingTimeInterval(15 * 60))
-        calendarEvents.append(CalendarEvent(
+        var updatedEvents = calendarEvents
+        updatedEvents.append(CalendarEvent(
             title: cleaned,
             startAt: startAt,
             endAt: safeEnd,
             notes: notes.trimmingCharacters(in: .whitespacesAndNewlines),
             tag: tag
         ))
-        calendarEvents.sort { $0.startAt < $1.startAt }
+        updatedEvents.sort { $0.startAt < $1.startAt }
+        calendarEvents = updatedEvents
     }
 
     func updateCalendarEvent(
@@ -303,12 +325,14 @@ final class DashboardStore: ObservableObject {
         let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty,
               let index = calendarEvents.firstIndex(where: { $0.id == id }) else { return }
-        calendarEvents[index].title = cleaned
-        calendarEvents[index].startAt = startAt
-        calendarEvents[index].endAt = max(endAt, startAt.addingTimeInterval(15 * 60))
-        calendarEvents[index].notes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        calendarEvents[index].tag = tag
-        calendarEvents.sort { $0.startAt < $1.startAt }
+        var updatedEvents = calendarEvents
+        updatedEvents[index].title = cleaned
+        updatedEvents[index].startAt = startAt
+        updatedEvents[index].endAt = max(endAt, startAt.addingTimeInterval(15 * 60))
+        updatedEvents[index].notes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        updatedEvents[index].tag = tag
+        updatedEvents.sort { $0.startAt < $1.startAt }
+        calendarEvents = updatedEvents
     }
 
     func deleteCalendarEvent(_ id: UUID) {

@@ -12,6 +12,7 @@ struct TodoChecks {
         try checkDailyFourAMBoundary()
         try checkPersistence()
         try checkCompletionInsights()
+        try checkCalendarNotifications()
         print("Dashboard persistence checks passed.")
     }
 
@@ -24,11 +25,17 @@ struct TodoChecks {
         return (UserDefaults(suiteName: suite)!, suite)
     }
 
-    private static func store(defaults: UserDefaults, now: @escaping () -> Date) -> DashboardStore {
+    private static func store(
+        defaults: UserDefaults,
+        now: @escaping () -> Date,
+        calendarNotificationScheduler: CalendarNotificationScheduling? = nil
+    ) -> DashboardStore {
         DashboardStore(
             defaults: defaults,
             nowProvider: now,
-            automaticallySchedulesTodoCleanup: false
+            automaticallySchedulesTodoCleanup: false,
+            calendarNotificationScheduler: calendarNotificationScheduler
+                ?? RecordingCalendarNotificationScheduler()
         )
     }
 
@@ -157,5 +164,82 @@ struct TodoChecks {
         let restored = store(defaults: defaults, now: { now.addingTimeInterval(60) })
         precondition(restored.todoCompletionHistory.map(\.title) == ["Finish reading"])
         precondition(restored.completedGoals.map(\.title) == ["Ship dashboard"])
+    }
+
+    private static func checkCalendarNotifications() throws {
+        let now = date("2026-09-21T10:00:00-04:00")
+        let event = CalendarEvent(
+            title: "College interview",
+            startAt: date("2026-09-21T12:00:00-04:00"),
+            endAt: date("2026-09-21T13:00:00-04:00"),
+            notes: "",
+            tag: .college
+        )
+        let descriptors = CalendarNotificationPlanner.descriptors(for: [event], now: now)
+        precondition(descriptors.count == 2)
+        precondition(descriptors.map(\.fireDate) == [
+            date("2026-09-21T11:30:00-04:00"),
+            date("2026-09-21T11:58:00-04:00")
+        ])
+        precondition(Set(descriptors.map(\.identifier)).count == 2)
+        precondition(descriptors[0].body.contains("30 minutes"))
+        precondition(descriptors[1].body.contains("2 minutes"))
+        precondition(CalendarNotificationPlanner.descriptors(
+            for: [event],
+            now: date("2026-09-21T11:45:00-04:00")
+        ).count == 1)
+
+        let (defaults, suite) = isolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let recorder = RecordingCalendarNotificationScheduler()
+        let subject = store(defaults: defaults, now: { now }, calendarNotificationScheduler: recorder)
+        recorder.reset()
+        subject.addCalendarEvent(
+            title: event.title,
+            startAt: event.startAt,
+            endAt: event.endAt,
+            notes: event.notes,
+            tag: event.tag
+        )
+        precondition(recorder.snapshots.count == 1 && recorder.snapshots[0].events.count == 1)
+        let eventID = subject.calendarEvents[0].id
+
+        subject.updateCalendarEvent(
+            eventID,
+            title: "Updated interview",
+            startAt: event.startAt.addingTimeInterval(60 * 60),
+            endAt: event.endAt.addingTimeInterval(60 * 60),
+            notes: "Bring questions",
+            tag: .college
+        )
+        precondition(recorder.snapshots.count == 2)
+        precondition(recorder.snapshots[1].events[0].id == eventID)
+        precondition(recorder.snapshots[1].events[0].title == "Updated interview")
+
+        subject.deleteCalendarEvent(eventID)
+        precondition(recorder.snapshots.count == 3 && recorder.snapshots[2].events.isEmpty)
+        precondition(recorder.snapshots.allSatisfy(\.requestAuthorizationIfNeeded))
+        print("PASS: calendar events schedule, update, and cancel 30-minute and 2-minute alerts")
+    }
+}
+
+@MainActor
+private final class RecordingCalendarNotificationScheduler: CalendarNotificationScheduling {
+    struct Snapshot {
+        let events: [CalendarEvent]
+        let requestAuthorizationIfNeeded: Bool
+    }
+
+    private(set) var snapshots: [Snapshot] = []
+
+    func reset() {
+        snapshots.removeAll()
+    }
+
+    func synchronize(events: [CalendarEvent], requestAuthorizationIfNeeded: Bool) {
+        snapshots.append(Snapshot(
+            events: events,
+            requestAuthorizationIfNeeded: requestAuthorizationIfNeeded
+        ))
     }
 }
