@@ -4,6 +4,7 @@ struct ClassificationSettingsView: View {
     @EnvironmentObject private var store: DashboardStore
     @EnvironmentObject private var tracker: ScreenTimeTracker
     @EnvironmentObject private var focusCat: FocusCatController
+    @EnvironmentObject private var deepFocus: DeepFocusController
 
     @State private var selection: ClassificationSelection = .unclassified
     @State private var newSubgroupClassification: ProductivityClassification?
@@ -66,6 +67,9 @@ struct ClassificationSettingsView: View {
 
             focusCatControl
                 .padding(.top, 16)
+
+            deepFocusControl
+                .padding(.top, 10)
 
             Button { selection = .unclassified } label: {
                 HStack {
@@ -144,6 +148,63 @@ struct ClassificationSettingsView: View {
         .background(Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11).stroke(Palette.border, lineWidth: 1))
+    }
+
+    private var deepFocusControl: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(deepFocus.isActive ? Palette.focus : Palette.muted)
+                    .frame(width: 24)
+                Text("Deep Focus")
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                if deepFocus.isActive {
+                    Text(deepFocusRemainingTime)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Palette.focus)
+                }
+            }
+
+            Text(deepFocus.isActive
+                 ? deepFocus.statusText
+                 : "Hard-block everything outside your Flow category.")
+                .font(.system(size: 10))
+                .foregroundStyle(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if deepFocus.isActive {
+                Button("End Deep Focus") { deepFocus.endSession() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                HStack(spacing: 8) {
+                    Picker("Duration", selection: $deepFocus.selectedDuration) {
+                        ForEach(DeepFocusDuration.allCases) { duration in
+                            Text(duration.displayName).tag(duration)
+                        }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity)
+
+                    Button("Start") { deepFocus.beginSelectedSession() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
+            }
+        }
+        .padding(11)
+        .background(Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Palette.border, lineWidth: 1))
+    }
+
+    private var deepFocusRemainingTime: String {
+        let total = max(0, Int(deepFocus.remainingSeconds.rounded(.up)))
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 
     private func classificationGroup(_ classification: ProductivityClassification) -> some View {

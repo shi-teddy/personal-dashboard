@@ -202,3 +202,49 @@ struct TrackedActivitySource: Identifiable, Hashable {
 
     var id: String { "\(kind.rawValue):\(identifier.lowercased())" }
 }
+
+enum DeepFocusDuration: Int, CaseIterable, Identifiable {
+    case thirtyMinutes = 30
+    case oneHour = 60
+    case twoHours = 120
+    case fourHours = 240
+
+    var id: Int { rawValue }
+    var seconds: TimeInterval { TimeInterval(rawValue * 60) }
+
+    var displayName: String {
+        switch self {
+        case .thirtyMinutes: "30 minutes"
+        case .oneHour: "1 hour"
+        case .twoHours: "2 hours"
+        case .fourHours: "4 hours"
+        }
+    }
+}
+
+enum DeepFocusPolicy {
+    static func isFlowApplication(bundleIdentifier: String?, displayName: String,
+                                  rules: [ActivityClassificationRule]) -> Bool {
+        rules.contains { rule in
+            guard rule.kind == .application, rule.classification == .flow else { return false }
+            if let bundleIdentifier,
+               rule.identifier.caseInsensitiveCompare(bundleIdentifier) == .orderedSame { return true }
+            return rule.identifier.caseInsensitiveCompare(displayName) == .orderedSame
+                || rule.displayName.caseInsensitiveCompare(displayName) == .orderedSame
+        }
+    }
+
+    static func isFlowWebsite(urlString: String, rules: [ActivityClassificationRule]) -> Bool {
+        guard let host = URL(string: urlString)?.host?.lowercased() else { return false }
+        return rules.contains { rule in
+            guard rule.kind == .website, rule.classification == .flow else { return false }
+            let configured = rule.identifier.lowercased()
+            return host == configured || host.hasSuffix(".\(configured)")
+        }
+    }
+
+    static func fiveMinuteWarningDate(endDate: Date, now: Date) -> Date? {
+        let warning = endDate.addingTimeInterval(-5 * 60)
+        return warning > now ? warning : nil
+    }
+}

@@ -105,6 +105,7 @@ final class FocusCatController: ObservableObject {
     private var lastHandledURL = ""
     private var lastHandledAt = Date.distantPast
     private var hasStarted = false
+    private var browserInterventionsSuspended = false
 
     init(defaults: UserDefaults = .standard, browserMonitoringEnabled: Bool = true,
          clock: @escaping () -> Date = Date.init,
@@ -155,6 +156,23 @@ final class FocusCatController: ObservableObject {
         guard isEnabled else { return }
         showPanel()
         panel?.orderFrontRegardless()
+    }
+
+    func setBrowserInterventionsSuspended(_ suspended: Bool) {
+        guard suspended != browserInterventionsSuspended else { return }
+        browserInterventionsSuspended = suspended
+        browserGeneration += 1
+        closeCancellation?.cancel()
+        detectionTimer?.invalidate()
+        detectionTimer = nil
+        if suspended {
+            if case .chrome = intervention {
+                moveHome(animated: false)
+            }
+        } else if isEnabled {
+            detectionInterval = 2.5
+            scheduleDetection(after: 0)
+        }
     }
 
     /// Runs the full approved wake, walk, paw, and return sequence without touching Chrome.
@@ -209,7 +227,7 @@ final class FocusCatController: ObservableObject {
                 forName: name, object: nil, queue: .main
             ) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, self.isEnabled else { return }
+                    guard let self, self.isEnabled, !self.browserInterventionsSuspended else { return }
                     self.detectionInterval = 2.5
                     self.scheduleDetection(after: 0)
                 }
@@ -514,7 +532,7 @@ final class FocusCatController: ObservableObject {
     private func scheduleDetection(after delay: TimeInterval) {
         detectionTimer?.invalidate()
         detectionTimer = nil
-        guard isEnabled, browserMonitoringEnabled, browserAvailable() else { return }
+        guard isEnabled, browserMonitoringEnabled, !browserInterventionsSuspended, browserAvailable() else { return }
         let timer = Timer(timeInterval: max(0.01, delay), repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -529,7 +547,7 @@ final class FocusCatController: ObservableObject {
 
     func scanChrome(now: Date? = nil, provider: (() async -> ChromeTarget?)? = nil) async {
         let now = now ?? clock()
-        guard isEnabled, browserMonitoringEnabled, browserAvailable(),
+        guard isEnabled, browserMonitoringEnabled, !browserInterventionsSuspended, browserAvailable(),
               pose == .sleeping, intervention == nil, !isReturningHome,
               !browserScanInFlight, now.timeIntervalSince(lastHandledAt) > 4 else { return }
         browserScanInFlight = true

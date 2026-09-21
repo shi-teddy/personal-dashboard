@@ -31,6 +31,7 @@ struct PersonalDashboardApp: App {
     @StateObject private var store = DashboardStore()
     @StateObject private var screenTimeTracker = ScreenTimeTracker()
     @StateObject private var focusCat = FocusCatController()
+    @StateObject private var deepFocus = DeepFocusController()
 
     var body: some Scene {
         WindowGroup {
@@ -38,9 +39,11 @@ struct PersonalDashboardApp: App {
                 .environmentObject(store)
                 .environmentObject(screenTimeTracker)
                 .environmentObject(focusCat)
+                .environmentObject(deepFocus)
                 .frame(minWidth: 1280, minHeight: 800)
                 .onAppear {
                     focusCat.start()
+                    deepFocus.start(store: store, focusCat: focusCat)
                     store.activateCalendarNotifications()
                 }
         }
